@@ -1,0 +1,22 @@
+{
+  "name": "claude-notebook",
+  "version": "1.0.0",
+  "description": "An Obsidian plugin that fuses a Markdown note with a live Claude agent, run through the Claude command-line tool.",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node guard.mjs && tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+  },
+  "keywords": ["obsidian", "claude"],
+  "author": "Avesta Jamali",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.23.0",
+    "obsidian": "^1.13.1",
+    "tslib": "^2.6.3",
+    "typescript": "^5.5.0"
+  }
+}

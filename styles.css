@@ -1,0 +1,347 @@
+/* Claude Notebook — styles (theme-agnostic: Obsidian CSS variables only) */
+
+.cn-root {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  background: var(--background-primary);
+}
+
+/* ── title bar ──────────────────────────────────────────────────────────── */
+.cn-titlebar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--size-2-3) var(--size-4-3);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.cn-title {
+  font-weight: var(--font-semibold);
+  color: var(--text-normal);
+}
+.cn-title-actions {
+  display: flex;
+  gap: var(--size-2-2);
+}
+.cn-btn {
+  font-size: var(--font-ui-smaller);
+  padding: var(--size-2-1) var(--size-2-3);
+  border: none;
+  border-radius: var(--radius-s);
+  background: var(--interactive-normal);
+  color: var(--text-normal);
+  cursor: pointer;
+}
+.cn-btn:hover {
+  background: var(--interactive-hover);
+}
+
+/* ── editor (bound note; Read renders, Edit is raw) ─────────────────────── */
+.cn-editor-wrap {
+  flex: 1 1 46%;
+  min-height: 2rem;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.cn-editor-wrap.is-collapsed {
+  flex: 0 0 auto;
+}
+.cn-editor-wrap.is-collapsed .cn-editor-body {
+  display: none;
+}
+.cn-editor-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  gap: var(--size-2-2);
+  padding: var(--size-2-2) var(--size-4-3);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.cn-chip {
+  font-size: var(--font-ui-smaller);
+  padding: var(--size-2-1) var(--size-2-3);
+  border: none;
+  border-radius: var(--radius-s);
+  background: var(--interactive-normal);
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.cn-chip:hover {
+  background: var(--interactive-hover);
+  color: var(--text-normal);
+}
+.cn-chip-collapse {
+  margin-left: auto;
+}
+.cn-editor-body {
+  flex: 1 1 auto;
+  display: flex;
+  overflow: hidden;
+}
+.cn-editor-read {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: var(--size-4-3);
+  color: var(--text-normal);
+}
+.cn-editor {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  resize: none;
+  border: none;
+  outline: none;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-family: var(--font-text);
+  font-size: var(--font-text-size);
+  line-height: var(--line-height-normal);
+  padding: var(--size-4-3);
+}
+
+/* ── chat thread ────────────────────────────────────────────────────────── */
+.cn-thread {
+  flex: 1 1 54%;
+  min-height: 4rem;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--background-modifier-border);
+  overflow: hidden;
+}
+.cn-thread.is-collapsed {
+  flex: 0 0 auto;
+}
+.cn-thread-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--size-2-2);
+  padding: var(--size-2-2) var(--size-4-3);
+  cursor: pointer;
+  user-select: none;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+.cn-thread-header:hover {
+  color: var(--text-normal);
+}
+.cn-thread.is-collapsed .cn-thread-body {
+  display: none;
+}
+.cn-thread-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: var(--size-4-2) var(--size-4-4) var(--size-4-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-2);
+}
+.cn-thread-empty {
+  margin: auto;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
+/* ── messages ───────────────────────────────────────────────────────────── */
+.cn-msg {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-2-1);
+}
+/* your turn = a compact right-aligned bubble */
+.cn-msg-you {
+  align-self: flex-end;
+  align-items: flex-end;
+  max-width: 85%;
+}
+.cn-msg-you .cn-msg-role {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+}
+.cn-msg-you .cn-msg-text {
+  padding: var(--size-2-2) var(--size-2-3);
+  border-radius: var(--radius-m);
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  white-space: pre-wrap;
+}
+/* claude turn = full-width rendered prose (desktop-app feel) */
+.cn-msg-claude {
+  align-self: stretch;
+  align-items: stretch;
+  max-width: 100%;
+}
+.cn-msg-claude .cn-msg-role {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-accent);
+  font-weight: var(--font-semibold);
+}
+.cn-msg-claude .cn-msg-text {
+  background: transparent;
+  color: var(--text-normal);
+  padding: 0;
+  line-height: var(--line-height-normal);
+}
+.cn-msg-claude .cn-msg-text > :first-child {
+  margin-top: 0;
+}
+.cn-msg-claude .cn-msg-text > :last-child {
+  margin-bottom: 0;
+}
+
+/* ── edit undo control ──────────────────────────────────────────────────── */
+.cn-undo {
+  display: flex;
+  align-items: center;
+  gap: var(--size-2-2);
+  padding: var(--size-2-1) 0;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+
+/* ── citation chips ─────────────────────────────────────────────────────── */
+.cn-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-2-2);
+  margin-top: var(--size-2-1);
+}
+.cn-cite {
+  font-size: var(--font-ui-smaller);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── prompt bar ─────────────────────────────────────────────────────────── */
+.cn-promptbar {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-2-2);
+  padding: var(--size-2-3) var(--size-4-3);
+  border-top: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+}
+.cn-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--size-4-3);
+}
+.cn-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--size-2-2);
+}
+.cn-action {
+  font-size: var(--font-ui-smaller);
+}
+.cn-seg-group {
+  display: flex;
+  align-items: center;
+  gap: var(--size-2-2);
+}
+.cn-seg-label {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-faint);
+}
+.cn-seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--radius-s);
+  background: var(--background-secondary);
+}
+.cn-seg-btn {
+  font-size: var(--font-ui-smaller);
+  padding: var(--size-2-1) var(--size-2-3);
+  border: none;
+  border-radius: var(--radius-s);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  text-transform: capitalize;
+}
+.cn-seg-btn.is-active {
+  background: var(--background-primary);
+  color: var(--text-normal);
+  box-shadow: var(--shadow-s);
+}
+.cn-input-row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--size-2-2);
+}
+.cn-prompt {
+  flex: 1 1 auto;
+  resize: none;
+  max-height: 160px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  padding: var(--size-2-2) var(--size-2-3);
+  font-family: var(--font-text);
+  font-size: var(--font-ui-small);
+  line-height: var(--line-height-tight);
+}
+.cn-prompt:focus {
+  border-color: var(--interactive-accent);
+  outline: none;
+}
+.cn-prompt:disabled {
+  opacity: 0.6;
+}
+.cn-send {
+  flex: 0 0 auto;
+  width: 2.2rem;
+  height: 2.2rem;
+  border: none;
+  border-radius: var(--radius-m);
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  cursor: pointer;
+  font-size: 1rem;
+}
+.cn-send:hover {
+  background: var(--interactive-accent-hover);
+}
+.cn-send.cn-stop {
+  background: var(--background-modifier-error);
+}
+.cn-send.cn-stop:hover {
+  background: var(--background-modifier-error-hover);
+}
+
+/* ── Study Desk: PDF/image cards fill their frame (no letterboxing) ─────── */
+.canvas-node-content.pdf-embed,
+.canvas-node-content .pdf-embed {
+  width: 100% !important;
+  height: 100% !important;
+}
+.canvas-node-content .pdf-container,
+.canvas-node-content .pdf-viewer-container,
+.canvas-node-content .pdf-viewer {
+  width: 100% !important;
+  height: 100% !important;
+}
+.canvas-node-content.media-embed img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* ── Study Desk: hovering a wikilink glows its target card ──────────────── */
+.canvas-node.cn-link-glow {
+  box-shadow:
+    0 0 0 3px var(--interactive-accent),
+    0 0 30px 8px color-mix(in srgb, var(--interactive-accent) 55%, transparent);
+  border-radius: var(--radius-m, 8px);
+  transition: box-shadow 130ms ease-out;
+  z-index: 15;
+}
