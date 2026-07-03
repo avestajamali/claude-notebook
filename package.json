@@ -1,6 +1,6 @@
 {
   "name": "claude-notebook",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "An Obsidian plugin that fuses a Markdown note with a live Claude agent, run through the Claude command-line tool.",
   "main": "main.js",
   "type": "module",

@@ -8,7 +8,7 @@ local text extraction is genuinely insufficient.
 Design principle
 ----------------
 A converted file is read by a SUBAGENT, never the main loop, and the result is
-cached in Engine/.cache/ so it is never re-converted.
+cached in a local .cache/ folder so it is never re-converted.
 
 Tier ladder (auto-selected per file)
 ------------------------------------

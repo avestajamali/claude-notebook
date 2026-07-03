@@ -6,10 +6,12 @@ import {
   ItemView,
   MarkdownRenderer,
   MarkdownView,
+  Menu,
   Modal,
   Notice,
   Plugin,
   PluginSettingTab,
+  setIcon,
   Setting,
   TFile,
   TFolder,
@@ -23,6 +25,18 @@ import * as path from "path";
 
 import { ingestFile, ingestLink } from "./ingest";
 import { CATEGORIES, Category } from "./facility";
+
+/**
+ * Set a button/label's content to a Lucide icon plus an optional text label.
+ * Replaces the emoji-in-string labels — icons inherit currentColor, so they
+ * re-tint correctly under every theme and state.
+ */
+function iconLabel(el: HTMLElement, icon: string, label?: string): void {
+  el.empty();
+  const ic = el.createSpan({ cls: "cn-ic" });
+  setIcon(ic, icon);
+  if (label) el.createSpan({ text: label });
+}
 
 /**
  * Absolute OS path of a dropped DOM File. Electron ≥32 (Obsidian 1.5+) removed
@@ -49,6 +63,7 @@ import { composeTeachRequest, recordTeachSession } from "./teach";
 import { DEFAULT_AVAILABILITY } from "./scheduler";
 
 import { ClaudeEngine } from "./engine";
+import { StreamRenderer } from "./stream-renderer";
 
 export const VIEW_TYPE_CLAUDE_NOTEBOOK = "claude-notebook";
 
@@ -146,6 +161,13 @@ interface CnSettings {
   lastNightlyRun: string;
   /** Study Desk: single-clicking a card grows it to reading size; deselect shrinks it back. */
   deskAutoFocus: boolean;
+  /** UI: note drawer open state + height (px), persisted across sessions. */
+  noteDrawerOpen: boolean;
+  noteDrawerHeight: number;
+  /** UI: show the six study presets as a permanent row instead of the ✦ menu. */
+  pinPresets: boolean;
+  /** UI: last-used study preset floats to the top of the ✦ menu. */
+  lastPreset: string;
 }
 
 const DEFAULT_SETTINGS: CnSettings = {
@@ -165,6 +187,10 @@ const DEFAULT_SETTINGS: CnSettings = {
   sweepMove: false,
   lastNightlyRun: "",
   deskAutoFocus: true,
+  noteDrawerOpen: false,
+  noteDrawerHeight: 260,
+  pinPresets: false,
+  lastPreset: "",
 };
 
 type Mode = "chat" | "edit" | "quiz";
@@ -181,13 +207,22 @@ interface CnViewState {
 class ClaudeNotebookView extends ItemView {
   private editorEl!: HTMLTextAreaElement;
   private editorReadEl!: HTMLElement;
-  private editToggleBtn!: HTMLElement;
+  private editorWrapEl!: HTMLElement;
   private editMode = false;
+  private viewSegBtns: Record<string, HTMLElement> = {};
+  private noteToggleBtn!: HTMLElement;
+  private noteBadge!: HTMLElement;
+  private noteOpen = false;
   private threadEl!: HTMLElement;
   private threadBodyEl!: HTMLElement;
   private promptEl!: HTMLTextAreaElement;
   private sendBtn!: HTMLButtonElement;
   private titleEl!: HTMLElement;
+  private composerEl!: HTMLElement;
+  private modeSegBtns: Record<string, HTMLElement> = {};
+  private modeCaption!: HTMLElement;
+  private noticeSlot!: HTMLElement;
+  private noticeKind: "undo" | "info" | null = null;
 
   private backingPath = SCRATCH_PATH;
   private backingFile: TFile | null = null;
@@ -197,7 +232,10 @@ class ClaudeNotebookView extends ItemView {
   private busy = false;
   private turnCancelled = false;
   private sessionId: string | null = null;
+  /** The mode the current CLI session was created under; a mode change re-mints the session. */
+  private sessionMode: Mode | null = null;
   private readonly engine = new ClaudeEngine();
+  private activeStream: StreamRenderer | null = null;
   private messages: ChatMsg[] = [];
 
   constructor(
@@ -238,10 +276,15 @@ class ClaudeNotebookView extends ItemView {
     root.empty();
     root.addClass("cn-root");
 
-    this.buildTitleBar(root);
-    this.buildEditor(root);
+    this.buildHeader(root);
+    this.buildNoteDrawer(root);
     this.buildThread(root);
-    this.buildPromptBar(root);
+    this.buildComposer(root);
+
+    // Narrow side-panels shed segment labels (icons stay); media queries can't see pane width.
+    const ro = new ResizeObserver(() => root.toggleClass("cn-narrow", root.clientWidth < 360));
+    ro.observe(root);
+    this.register(() => ro.disconnect());
 
     await this.loadBackingFile();
     this.updateTitle();
@@ -293,12 +336,12 @@ class ClaudeNotebookView extends ItemView {
         }
         new Notice(`Ingesting ${files[i].name}…`);
         const r = await ingestFile(this.app, cfg, p);
-        blurbs.push(r.ok ? r.blurb ?? r.notePath ?? "ingested" : `⚠ ${files[i].name}: ${r.error}`);
+        blurbs.push(r.ok ? r.blurb ?? r.notePath ?? "ingested" : `Failed — ${files[i].name}: ${r.error}`);
       }
     } else if (isUrl) {
       new Notice("Saving link…");
       const r = await ingestLink(this.app, cfg, link);
-      blurbs.push(r.ok ? r.blurb ?? r.notePath ?? "saved" : `⚠ ${r.error}`);
+      blurbs.push(r.ok ? r.blurb ?? r.notePath ?? "saved" : `Failed — ${r.error}`);
     }
     if (blurbs.length && this.promptEl) {
       const cur = this.promptEl.value;
@@ -319,67 +362,163 @@ class ClaudeNotebookView extends ItemView {
   async onClose(): Promise<void> {
     if (this.saveTimer) window.clearTimeout(this.saveTimer);
     this.engine.cancel();
+    this.activeStream?.cancel(); // no rAF may survive the view — plugin unloads clean
+    this.activeStream = null;
     await this.saveNow();
+    // Flush the debounced conversation save too, or a reply from the last ~600ms is lost.
+    await this.plugin.flush();
     this.contentEl.empty();
   }
 
   // ── layout ────────────────────────────────────────────────────────────────
 
-  private buildTitleBar(root: HTMLElement): void {
-    const bar = root.createDiv({ cls: "cn-titlebar" });
-    this.titleEl = bar.createSpan({ cls: "cn-title", text: "📓 Claude Notebook" });
+  /** One slim header: icon + note name, a note-drawer toggle, and an overflow menu. */
+  private buildHeader(root: HTMLElement): void {
+    const bar = root.createDiv({ cls: "cn-header" });
+    const title = bar.createSpan({ cls: "cn-title" });
+    const ic = title.createSpan({ cls: "cn-ic" });
+    setIcon(ic, "book-open");
+    this.titleEl = title.createSpan({ cls: "cn-title-text", text: "Claude Notebook" });
+
     const actions = bar.createDiv({ cls: "cn-title-actions" });
-    const saveBtn = actions.createEl("button", {
-      cls: "cn-btn",
-      text: "Save as study note",
-    });
-    saveBtn.onclick = () => this.openSaveModal();
+    this.noteToggleBtn = actions.createEl("button", { cls: "cn-btn cn-btn--icon" });
+    this.noteToggleBtn.setAttr("aria-label", "Show or hide the note");
+    this.noteToggleBtn.setAttr("title", "Show or hide the note");
+    this.noteToggleBtn.onclick = () => this.setNoteOpen(!this.noteOpen);
+
+    const menuBtn = actions.createEl("button", { cls: "cn-btn cn-btn--icon" });
+    setIcon(menuBtn, "more-horizontal");
+    menuBtn.setAttr("aria-label", "More actions");
+    menuBtn.setAttr("title", "More actions");
+    menuBtn.onclick = (e) => {
+      const menu = new Menu();
+      menu.addItem((i) => i.setTitle("Save as study note").setIcon("save").onClick(() => this.openSaveModal()));
+      menu.addItem((i) => i.setTitle("Open Study Desk").setIcon("layout-grid").onClick(() => void this.plugin.openDesk()));
+      menu.addSeparator();
+      menu.addItem((i) => i.setTitle("Clear chat thread").setIcon("trash-2").onClick(() => this.clearThread()));
+      menu.showAtMouseEvent(e);
+    };
   }
 
   private updateTitle(): void {
-    const name = this.backingFile?.basename ?? "Claude Notebook";
-    if (name === "Claude Notebook") {
-      this.titleEl.setText("📓 Claude Notebook");
-    } else {
-      this.titleEl.setText(`📓 ${name}`);
-    }
+    this.titleEl.setText(this.backingFile?.basename ?? "Claude Notebook");
   }
 
-  private buildEditor(root: HTMLElement): void {
-    const wrap = root.createDiv({ cls: "cn-editor-wrap" });
+  /** Reset this note's conversation (thread + session) after confirmation-free single click. */
+  private clearThread(): void {
+    if (this.busy) {
+      new Notice("Wait for the current turn to finish (or press Stop) first.");
+      return;
+    }
+    this.messages = [];
+    this.sessionId = null;
+    this.sessionMode = null;
+    this.persist();
+    this.renderThread();
+  }
 
-    const toolbar = wrap.createDiv({ cls: "cn-editor-toolbar" });
-    this.editToggleBtn = toolbar.createEl("button", { cls: "cn-chip", text: "✎ Edit" });
-    this.editToggleBtn.onclick = () => this.toggleEditMode();
+  /** Generic icon+label segmented control; active state is matched on data-seg-value. */
+  private buildIconSeg(
+    parent: HTMLElement,
+    items: { value: string; icon: string; label: string }[],
+    current: string,
+    onPick: (v: string) => void,
+  ): Record<string, HTMLElement> {
+    const seg = parent.createDiv({ cls: "cn-seg" });
+    const btns: Record<string, HTMLElement> = {};
+    for (const it of items) {
+      const b = seg.createEl("button", { cls: "cn-btn cn-btn--seg" });
+      const ic = b.createSpan({ cls: "cn-ic" });
+      setIcon(ic, it.icon);
+      b.createSpan({ cls: "cn-seg-text", text: it.label });
+      b.setAttr("data-seg-value", it.value);
+      b.setAttr("aria-label", it.label);
+      b.setAttr("title", it.label);
+      if (it.value === current) b.addClass("is-active");
+      b.onclick = () => {
+        Object.values(btns).forEach((x) => x.removeClass("is-active"));
+        b.addClass("is-active");
+        onPick(it.value);
+      };
+      btns[it.value] = b;
+    }
+    return btns;
+  }
 
-    const collapseBtn = toolbar.createEl("button", {
-      cls: "cn-chip cn-chip-collapse",
-      text: "▴ Hide note",
-    });
-    collapseBtn.onclick = () => {
-      const willCollapse = !wrap.hasClass("is-collapsed");
-      wrap.toggleClass("is-collapsed", willCollapse);
-      collapseBtn.setText(willCollapse ? "▾ Show note" : "▴ Hide note");
-    };
+  /** The note companion: a drawer under the header, closed by default, resizable when open. */
+  private buildNoteDrawer(root: HTMLElement): void {
+    const wrap = root.createDiv({ cls: "cn-note" });
+    this.editorWrapEl = wrap;
+
+    const toolbar = wrap.createDiv({ cls: "cn-note-toolbar" });
+    this.viewSegBtns = this.buildIconSeg(
+      toolbar,
+      [
+        { value: "read", icon: "eye", label: "Read" },
+        { value: "edit", icon: "pencil", label: "Edit" },
+      ],
+      this.editMode ? "edit" : "read",
+      (v) => {
+        this.editMode = v === "edit";
+        this.applyEditMode();
+      },
+    );
+    this.noteBadge = toolbar.createSpan({ cls: "cn-note-badge" });
 
     const body = wrap.createDiv({ cls: "cn-editor-body" });
     this.editorReadEl = body.createDiv({ cls: "cn-editor-read markdown-rendered" });
     this.editorEl = body.createEl("textarea", { cls: "cn-editor" });
-    this.editorEl.placeholder = "Write freely…  toggle to Read to render formulas.";
-    this.editorEl.addEventListener("input", () => this.scheduleSave());
+    this.editorEl.placeholder = "Write freely…  switch to Read to render formulas.";
+    this.editorEl.addEventListener("input", () => {
+      this.noteBadge.setText("Editing…");
+      this.scheduleSave();
+    });
+
+    // Drag the bottom edge to resize; height persists across sessions.
+    const handle = wrap.createDiv({ cls: "cn-note-resize" });
+    handle.setAttr("aria-label", "Drag to resize the note");
+    this.registerDomEvent(handle, "pointerdown", (e: PointerEvent) => {
+      e.preventDefault();
+      handle.setPointerCapture(e.pointerId);
+      const startY = e.clientY;
+      const startH = wrap.getBoundingClientRect().height;
+      const max = Math.max(160, root.clientHeight * 0.85);
+      const onMove = (ev: PointerEvent) => {
+        const h = Math.min(max, Math.max(96, startH + (ev.clientY - startY)));
+        wrap.style.height = `${h}px`;
+      };
+      const onUp = () => {
+        handle.removeEventListener("pointermove", onMove);
+        handle.removeEventListener("pointerup", onUp);
+        this.plugin.cfg.noteDrawerHeight = Math.round(wrap.getBoundingClientRect().height);
+        void this.plugin.saveSettings();
+      };
+      handle.addEventListener("pointermove", onMove);
+      handle.addEventListener("pointerup", onUp);
+    });
 
     this.applyEditMode();
+    this.setNoteOpen(this.plugin.cfg.noteDrawerOpen, true);
   }
 
-  private toggleEditMode(): void {
-    this.editMode = !this.editMode;
-    this.applyEditMode();
+  /** Open/close the note drawer (header toggle); state and height persist. */
+  private setNoteOpen(open: boolean, skipPersist = false): void {
+    this.noteOpen = open;
+    this.editorWrapEl.toggleClass("is-open", open);
+    this.editorWrapEl.style.height = open ? `${this.plugin.cfg.noteDrawerHeight || 260}px` : "";
+    setIcon(this.noteToggleBtn, open ? "panel-top-close" : "panel-top-open");
+    this.noteToggleBtn.setAttr("aria-label", open ? "Hide the note" : "Show the note");
+    this.noteToggleBtn.setAttr("title", open ? "Hide the note" : "Show the note");
+    if (open && !this.editMode) void this.renderRead();
+    if (!skipPersist) {
+      this.plugin.cfg.noteDrawerOpen = open;
+      void this.plugin.saveSettings();
+    }
   }
 
   private applyEditMode(): void {
-    this.editorEl.style.display = this.editMode ? "" : "none";
-    this.editorReadEl.style.display = this.editMode ? "none" : "";
-    this.editToggleBtn.setText(this.editMode ? "👁 Read" : "✎ Edit");
+    // View state lives in a data attribute (CSS shows/hides), not inline styles.
+    this.editorWrapEl.setAttr("data-view", this.editMode ? "edit" : "read");
     if (this.editMode) this.editorEl.focus();
     else void this.renderRead();
   }
@@ -410,41 +549,47 @@ class ClaudeNotebookView extends ItemView {
   }
 
   private buildThread(root: HTMLElement): void {
+    // The thread is the hero — always visible, never collapses.
     this.threadEl = root.createDiv({ cls: "cn-thread" });
-
-    const header = this.threadEl.createDiv({ cls: "cn-thread-header" });
-    const chevron = header.createSpan({ cls: "cn-chevron", text: "▾" });
-    header.createSpan({ cls: "cn-thread-title", text: "Chat" });
-    header.onclick = () => {
-      const willCollapse = !this.threadEl.hasClass("is-collapsed");
-      this.threadEl.toggleClass("is-collapsed", willCollapse);
-      chevron.setText(willCollapse ? "▸" : "▾");
-    };
-
     this.threadBodyEl = this.threadEl.createDiv({ cls: "cn-thread-body" });
     this.renderThreadEmpty();
   }
 
+  /** Calm empty state that names the invisible affordances and teaches by doing. */
   private renderThreadEmpty(): void {
     this.threadBodyEl.empty();
-    this.threadBodyEl.createDiv({
-      cls: "cn-thread-empty",
-      text: "No messages yet — ask, quiz, or request an edit below.",
+    const box = this.threadBodyEl.createDiv({ cls: "cn-thread-empty" });
+    box.createDiv({ cls: "cn-empty-title", text: "Ask about this note" });
+    box.createDiv({
+      cls: "cn-empty-sub",
+      text: "Chat, request an edit, or quiz yourself. Drop a PDF or link anywhere to file it — paste an image to transcribe it.",
     });
+    const row = box.createDiv({ cls: "cn-empty-row" });
+    const examples = [
+      "Summarise this note in 5 bullets",
+      "Quiz me on this note",
+      "What's the hardest concept here?",
+    ];
+    for (const ex of examples) {
+      const b = row.createEl("button", { cls: "cn-btn cn-empty-btn", text: ex });
+      b.onclick = () => {
+        this.promptEl.value = ex;
+        this.autoGrow();
+        this.promptEl.focus();
+      };
+    }
   }
 
-  private buildPromptBar(root: HTMLElement): void {
-    const bar = root.createDiv({ cls: "cn-promptbar" });
+  /** The anchor: one bordered card — notice slot above it, textarea, then a single action bar. */
+  private buildComposer(root: HTMLElement): void {
+    const outer = root.createDiv({ cls: "cn-composer-wrap" });
+    this.noticeSlot = outer.createDiv({ cls: "cn-notice-slot" });
+    if (this.plugin.cfg.pinPresets) this.buildPresetRow(outer);
 
-    const controls = bar.createDiv({ cls: "cn-controls" });
-    this.buildSegmented(controls, "Mode", ["chat", "edit", "quiz"], this.mode, (v) => {
-      this.mode = v as Mode;
-    });
+    const card = outer.createDiv({ cls: "cn-composer" });
+    this.composerEl = card;
 
-    this.buildActions(bar);
-
-    const inputRow = bar.createDiv({ cls: "cn-input-row" });
-    this.promptEl = inputRow.createEl("textarea", { cls: "cn-prompt" });
+    this.promptEl = card.createEl("textarea", { cls: "cn-prompt" });
     this.promptEl.placeholder =
       "Ask, quiz me, or request an edit…  (Enter to send · Shift+Enter for newline)";
     this.promptEl.rows = 1;
@@ -453,110 +598,160 @@ class ClaudeNotebookView extends ItemView {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         void this.handleSend();
+      } else if (e.key === "Escape" && this.busy) {
+        e.preventDefault();
+        this.cancelTurn();
       }
     });
 
-    this.sendBtn = inputRow.createEl("button", { cls: "cn-send", text: "➤" });
+    const barRow = card.createDiv({ cls: "cn-composer-bar" });
+    const modeWrap = barRow.createDiv({ cls: "cn-mode" });
+    this.modeSegBtns = this.buildIconSeg(
+      modeWrap,
+      [
+        { value: "chat", icon: "message-circle", label: "Chat" },
+        { value: "edit", icon: "pencil", label: "Edit" },
+        { value: "quiz", icon: "graduation-cap", label: "Quiz" },
+      ],
+      this.mode,
+      (v) => this.setModeUI(v as Mode),
+    );
+    this.modeCaption = modeWrap.createSpan({ cls: "cn-mode-caption" });
+
+    const presetBtn = barRow.createEl("button", { cls: "cn-btn cn-btn--icon cn-presets-btn" });
+    setIcon(presetBtn, "sparkles");
+    presetBtn.setAttr("aria-label", "Study actions");
+    presetBtn.setAttr("title", "Study actions");
+    presetBtn.onclick = (e) => this.openPresetMenu(e);
+
+    this.sendBtn = barRow.createEl("button", { cls: "cn-btn cn-btn--accent cn-send" });
+    setIcon(this.sendBtn, "send");
     this.sendBtn.setAttr("aria-label", "Send");
     this.sendBtn.onclick = () => {
       if (this.busy) this.cancelTurn();
       else void this.handleSend();
     };
+
+    this.applyModeCaption();
   }
 
-  private buildSegmented(
-    parent: HTMLElement,
-    label: string,
-    opts: string[],
-    current: string,
-    onPick: (v: string) => void,
-  ): void {
-    const group = parent.createDiv({ cls: "cn-seg-group" });
-    group.createSpan({ cls: "cn-seg-label", text: label });
-    const seg = group.createDiv({ cls: "cn-seg" });
-    const btns: HTMLElement[] = [];
-    for (const opt of opts) {
-      const b = seg.createEl("button", { cls: "cn-seg-btn", text: opt });
-      if (opt === current) b.addClass("is-active");
-      b.onclick = () => {
-        btns.forEach((x) => x.removeClass("is-active"));
-        b.addClass("is-active");
-        onPick(opt);
-      };
-      btns.push(b);
-    }
+  /** The always-on consequence caption — the mode's file-safety signal in plain words. */
+  private applyModeCaption(): void {
+    const captions: Record<Mode, string> = {
+      chat: "reads your note",
+      edit: "can rewrite this file",
+      quiz: "asks you questions",
+    };
+    if (this.mode === "edit") iconLabel(this.modeCaption, "pencil", captions.edit);
+    else this.modeCaption.setText(captions[this.mode]);
   }
 
-  /** One-tap study-action presets (the 12 study workflows surfaced as buttons). */
-  private buildActions(bar: HTMLElement): void {
-    const row = bar.createDiv({ cls: "cn-actions" });
-    const presets: { label: string; prompt: string; send: boolean; mode?: Mode }[] = [
+  /** Study presets live in the ✦ menu by default (opt-in pinned row via settings). */
+  private getPresets(): { icon: string; label: string; prompt: string; send: boolean; mode?: Mode }[] {
+    const presets: { icon: string; label: string; prompt: string; send: boolean; mode?: Mode }[] = [
       {
-        label: "🧪 Practice Qs",
+        icon: "flask-conical",
+        label: "Practice Qs",
         prompt:
           "Generate 8 exam-style practice questions from this note (a mix of multiple-choice and short calculation), then a separate '## Answer Key' with fully worked solutions. Cite each answer to its source.",
         send: true,
       },
       {
-        label: "🧠 Flashcards",
+        icon: "layers",
+        label: "Flashcards",
         prompt:
           "Make 15 spaced-repetition flashcards from this note in single-line `Question::Answer` format (one per line), using `==cloze==` deletions for key formulas. Put a `#flashcards` tag line at the top. Cite sources where natural.",
         send: true,
       },
       {
-        label: "🎓 Explain simply",
+        icon: "graduation-cap",
+        label: "Explain simply",
         prompt:
           "Explain the single hardest concept in this note like I'm struggling — plain English, a real-world analogy, one tiny worked example, and the exact thing students get wrong. Ground it in my notes.",
         send: true,
       },
       {
-        label: "🔮 Predict exam",
+        icon: "sparkles",
+        label: "Predict exam",
         prompt:
           "Predict 6 likely exam questions based on what this note emphasises most, each with a one-line 'why I predict this' tied to how often the concept recurs.",
         send: true,
       },
       {
-        label: "🩻 Weak spots",
+        icon: "scan-line",
+        label: "Weak spots",
         prompt:
           "Scan this note for gaps — thin topics, formulas with no worked example, claims with no example — and rank them by exam risk in a short table (Risk | Topic | Gap | Fix).",
         send: true,
       },
       {
-        label: "✅ Mark my answer",
+        icon: "check",
+        label: "Mark my answer",
         prompt:
           "Mark my attempt against my notes ONLY. Give the model answer, a mark out of 10, and exactly where I lost marks.\n\n--- paste your attempt below this line, then send ---\n",
         send: false,
       },
     ];
-    for (const p of presets) {
-      const chip = row.createEl("button", { cls: "cn-chip cn-action", text: p.label });
-      chip.onclick = () => {
-        if (this.busy) return;
-        this.setModeUI(p.mode ?? "chat");
-        this.promptEl.value = p.prompt;
-        this.autoGrow();
-        if (p.send) {
-          void this.handleSend();
-        } else {
-          this.promptEl.focus();
-          this.promptEl.setSelectionRange(this.promptEl.value.length, this.promptEl.value.length);
-        }
-      };
+    // Last-used preset floats to the top of the menu.
+    const last = this.plugin.cfg.lastPreset;
+    if (last) {
+      const i = presets.findIndex((p) => p.label === last);
+      if (i > 0) presets.unshift(presets.splice(i, 1)[0]);
+    }
+    return presets;
+  }
+
+  private runPreset(p: { label: string; prompt: string; send: boolean; mode?: Mode }): void {
+    if (this.busy) {
+      new Notice("Wait for the current turn to finish (or press Stop) first.");
+      return;
+    }
+    this.plugin.cfg.lastPreset = p.label;
+    void this.plugin.saveSettings();
+    this.setModeUI(p.mode ?? "chat");
+    this.promptEl.value = p.prompt;
+    this.autoGrow();
+    if (p.send) {
+      void this.handleSend();
+    } else {
+      this.promptEl.focus();
+      this.promptEl.setSelectionRange(this.promptEl.value.length, this.promptEl.value.length);
     }
   }
 
-  /** Set the active mode + reflect it in the segmented control. */
+  private openPresetMenu(e: MouseEvent): void {
+    const menu = new Menu();
+    for (const p of this.getPresets()) {
+      menu.addItem((i) => i.setTitle(p.label).setIcon(p.icon).onClick(() => this.runPreset(p)));
+    }
+    menu.showAtMouseEvent(e);
+  }
+
+  /** Opt-in visible preset row (settings: "Pin study presets"), for people who live in them. */
+  private buildPresetRow(parent: HTMLElement): void {
+    const row = parent.createDiv({ cls: "cn-actions" });
+    for (const p of this.getPresets()) {
+      const chip = row.createEl("button", { cls: "cn-btn cn-action" });
+      iconLabel(chip, p.icon, p.label);
+      chip.onclick = () => this.runPreset(p);
+    }
+  }
+
+  /** Set the active mode + reflect it in the mode control, root state, and safety caption. */
   private setModeUI(m: Mode): void {
     this.mode = m;
-    this.contentEl.querySelectorAll<HTMLElement>(".cn-seg-btn").forEach((b) => {
-      b.toggleClass("is-active", (b.textContent ?? "").trim() === m);
-    });
+    this.contentEl.toggleClass("cn-mode-edit", m === "edit");
+    (this.contentEl as HTMLElement).setAttr("data-mode", m);
+    Object.entries(this.modeSegBtns).forEach(([v, b]) => b.toggleClass("is-active", v === m));
+    this.applyModeCaption();
   }
 
   private autoGrow(): void {
     const el = this.promptEl;
     el.style.height = "auto";
-    el.style.height = Math.min(el.scrollHeight, 160) + "px";
+    // Clamp by line count (~7 lines), not a hardcoded pixel height.
+    const line = parseFloat(getComputedStyle(el).lineHeight) || 20;
+    el.style.height = Math.min(el.scrollHeight, Math.round(line * 7 + 16)) + "px";
   }
 
   // ── interaction (engine arrives in S2) ─────────────────────────────────────
@@ -565,20 +760,38 @@ class ClaudeNotebookView extends ItemView {
     const text = this.promptEl.value.trim();
     if (!text || this.busy) return;
 
+    this.clearInfoNotice(); // saved/stopped notices are per-moment; a pending undo survives
     this.addMessage("you", text);
     this.promptEl.value = "";
     this.autoGrow();
     this.setBusy(true);
 
-    // flush the editor to disk so Claude reads the current content
+    // Flush the editor to disk so Claude reads the current content, then cancel any pending
+    // debounced save so a stale pre-edit buffer can't overwrite Claude's edit mid-turn.
     await this.saveNow();
+    if (this.saveTimer) {
+      window.clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+
+    const isEdit = this.mode === "edit";
+    // A resumed session's system prompt is fixed, so a mode change can't take effect on it —
+    // re-mint the session whenever the mode differs from the one it was created under.
+    if (this.sessionId && this.sessionMode !== this.mode) this.sessionId = null;
 
     const notePath = this.backingFile?.path ?? SCRATCH_PATH;
-    const isEdit = this.mode === "edit";
+    const turnPath = this.backingPath; // if the view is rebound mid-turn, don't cross the streams
     const snapshot = isEdit ? this.editorEl.value : null; // for one-click undo
     const editFile = isEdit ? this.backingFile : null; // the exact file the undo restores
 
     const streamEl = this.startAssistantStream();
+    const stream = new StreamRenderer(streamEl, this.app, notePath, this, {
+      isAtBottom: () => this.isAtBottom(),
+      onGrow: (stick) => {
+        if (stick) this.scrollThread(); // don't yank a reader who scrolled up
+      },
+    });
+    this.activeStream = stream;
     let streamed = "";
 
     this.engine.run(
@@ -592,29 +805,30 @@ class ClaudeNotebookView extends ItemView {
       {
         onText: (delta) => {
           streamed += delta;
-          streamEl.setText(streamed);
-          this.scrollThread();
+          stream.push(delta);
         },
         onDone: async ({ sessionId, text: finalText, error }) => {
-          if (this.turnCancelled) {
+          if (this.turnCancelled || this.backingPath !== turnPath) {
+            stream.cancel(); // stop the loop; leave what streamed rendered cleanly
             this.setBusy(false);
             return;
           }
           try {
             this.sessionId = sessionId ?? this.sessionId; // never clobber a live session with null
-            streamEl.empty();
-            const md = error ? `⚠️ ${error}` : finalText || streamed || "_(done)_";
-            await MarkdownRenderer.render(this.app, md, streamEl, notePath, this);
+            if (this.sessionId) this.sessionMode = this.mode; // record what this session was minted for
+            const md = error ? `**Error:** ${error}` : finalText || streamed || "_(done)_";
+            await stream.finish(md); // in place when md is what streamed; clean render otherwise
             if (!error) {
               this.addCitationChips(finalText || streamed, notePath);
               this.recordClaude(finalText || streamed);
+              if (this.isAtBottom()) this.scrollThread(); // chips landed below — keep a follower on them
             }
             if (isEdit && !error) {
               await this.forceReload();
               this.addUndo(snapshot, editFile);
             }
-            this.scrollThread();
           } finally {
+            if (this.activeStream === stream) this.activeStream = null;
             this.setBusy(false);
           }
         },
@@ -626,30 +840,58 @@ class ClaudeNotebookView extends ItemView {
     this.threadBodyEl.scrollTop = this.threadBodyEl.scrollHeight;
   }
 
-  /** Re-read the bound file from disk into the editor (after Claude edits it). */
+  /** True when the thread is scrolled to (or near) the bottom — used to avoid auto-scroll hijack. */
+  private isAtBottom(): boolean {
+    const el = this.threadBodyEl;
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  }
+
+  /** Re-read the bound file from disk into the editor (after Claude edits it) — only if it changed. */
   private async forceReload(): Promise<void> {
     if (!this.backingFile) return;
     if (this.saveTimer) {
       window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    this.editorEl.value = await this.app.vault.read(this.backingFile);
-    this.refreshEditorView();
+    const content = await this.app.vault.read(this.backingFile);
+    if (content !== this.editorEl.value) {
+      this.editorEl.value = content;
+      this.refreshEditorView();
+    }
   }
 
   /** One-click undo: restore the pre-edit snapshot of the bound note. */
+  /** One pinned notice above the composer. An unused UNDO is never displaced by info notices. */
+  private setNotice(kind: "undo" | "info", build: (bar: HTMLElement) => void): void {
+    if (this.noticeKind === "undo" && kind === "info") return; // protect the only revert path
+    this.noticeSlot.empty();
+    this.noticeKind = kind;
+    const bar = this.noticeSlot.createDiv({ cls: "cn-undo" });
+    build(bar);
+  }
+
+  /** Clear transient info notices (called on the next send); a pending undo stays. */
+  private clearInfoNotice(): void {
+    if (this.noticeKind === "info") {
+      this.noticeSlot.empty();
+      this.noticeKind = null;
+    }
+  }
+
   private addUndo(snapshot: string | null, file: TFile | null): void {
     if (snapshot === null || !file) return;
-    const bar = this.threadBodyEl.createDiv({ cls: "cn-undo" });
-    bar.createSpan({ cls: "cn-undo-label", text: "✏️ Claude edited the note." });
-    const btn = bar.createEl("button", { cls: "cn-chip", text: "Undo" });
-    btn.onclick = async () => {
-      await this.app.vault.modify(file, snapshot); // restore the exact file we edited
-      if (this.backingFile?.path === file.path) await this.forceReload();
-      btn.disabled = true;
-      btn.setText("Undone ✓");
-    };
-    this.scrollThread();
+    this.setNotice("undo", (bar) => {
+      const label = bar.createSpan({ cls: "cn-undo-label" });
+      iconLabel(label, "pencil-line", "Claude edited the note.");
+      const btn = bar.createEl("button", { cls: "cn-btn", text: "Undo" });
+      btn.onclick = async () => {
+        await this.app.vault.modify(file, snapshot); // restore the exact file we edited
+        if (this.backingFile?.path === file.path) await this.forceReload();
+        btn.disabled = true;
+        iconLabel(btn, "check", "Undone");
+        this.noticeKind = "info"; // consumed — the next send may clear it
+      };
+    });
   }
 
   /** Render the [[wikilinks]] Claude cited as clickable chips below a reply. */
@@ -661,7 +903,8 @@ class ClaudeNotebookView extends ItemView {
     if (links.size === 0) return;
     const bar = this.threadBodyEl.createDiv({ cls: "cn-chips" });
     links.forEach((link) => {
-      const chip = bar.createEl("button", { cls: "cn-chip cn-cite", text: `🔗 ${link}` });
+      const chip = bar.createEl("button", { cls: "cn-btn cn-cite" });
+      iconLabel(chip, "link", link);
       chip.onclick = () => void this.app.workspace.openLinkText(link, sourcePath, true);
     });
     this.scrollThread();
@@ -704,8 +947,15 @@ class ClaudeNotebookView extends ItemView {
       .replace(/^-|-$/g, "");
 
     this.setBusy(true);
-    this.addMessage("you", `💾 Save as study note — ${token}: “${safeTopic}”`);
+    this.addMessage("you", `Save as study note — ${token}: “${safeTopic}”`);
     const streamEl = this.startAssistantStream();
+    const stream = new StreamRenderer(streamEl, this.app, targetPath, this, {
+      isAtBottom: () => this.isAtBottom(),
+      onGrow: (stick) => {
+        if (stick) this.scrollThread();
+      },
+    });
+    this.activeStream = stream;
     let streamed = "";
 
     const prompt =
@@ -735,26 +985,25 @@ class ClaudeNotebookView extends ItemView {
       {
         onText: (d) => {
           streamed += d;
-          streamEl.setText(streamed);
-          this.scrollThread();
+          stream.push(d);
         },
         onDone: async ({ text: finalText, error }) => {
           if (this.turnCancelled) {
+            stream.cancel();
             this.setBusy(false);
             return;
           }
           try {
-            streamEl.empty();
-            const md = error ? `⚠️ ${error}` : finalText || streamed || "Saved.";
-            await MarkdownRenderer.render(this.app, md, streamEl, targetPath, this);
+            const md = error ? `**Error:** ${error}` : finalText || streamed || "Saved.";
+            await stream.finish(md);
             if (!error) {
               this.recordClaude(md);
               const created = this.app.vault.getAbstractFileByPath(targetPath);
               if (created instanceof TFile) this.addOpenLink(targetPath, `${safeTopic} — ${token}`);
               else new Notice("Study note created — check the Study folder.");
             }
-            this.scrollThread();
           } finally {
+            if (this.activeStream === stream) this.activeStream = null;
             this.setBusy(false);
           }
         },
@@ -763,11 +1012,12 @@ class ClaudeNotebookView extends ItemView {
   }
 
   private addOpenLink(path: string, label: string): void {
-    const bar = this.threadBodyEl.createDiv({ cls: "cn-undo" });
-    bar.createSpan({ cls: "cn-undo-label", text: `✅ Saved: ${label}` });
-    const btn = bar.createEl("button", { cls: "cn-chip", text: "Open" });
-    btn.onclick = () => void this.app.workspace.openLinkText(path, "", true);
-    this.scrollThread();
+    this.setNotice("info", (bar) => {
+      const saved = bar.createSpan({ cls: "cn-undo-label" });
+      iconLabel(saved, "check", `Saved: ${label}`);
+      const btn = bar.createEl("button", { cls: "cn-btn", text: "Open" });
+      btn.onclick = () => void this.app.workspace.openLinkText(path, "", true);
+    });
   }
 
   // ── image transcription ────────────────────────────────────────────────────
@@ -819,8 +1069,21 @@ class ClaudeNotebookView extends ItemView {
 
   private async transcribeImage(imgPath: string, imgName: string): Promise<void> {
     this.setBusy(true);
-    this.addMessage("you", "🖼️ Transcribe pasted image");
+    this.addMessage("you", "Transcribe pasted image");
     const streamEl = this.startAssistantStream();
+    const stream = new StreamRenderer(
+      streamEl,
+      this.app,
+      this.backingFile?.path ?? SCRATCH_PATH,
+      this,
+      {
+        isAtBottom: () => this.isAtBottom(),
+        onGrow: (stick) => {
+          if (stick) this.scrollThread();
+        },
+      },
+    );
+    this.activeStream = stream;
     let streamed = "";
 
     const prompt =
@@ -835,19 +1098,17 @@ class ClaudeNotebookView extends ItemView {
       {
         onText: (d) => {
           streamed += d;
-          streamEl.setText(streamed);
-          this.scrollThread();
+          stream.push(d);
         },
         onDone: async ({ text: finalText, error }) => {
           if (this.turnCancelled) {
+            stream.cancel();
             this.setBusy(false);
             return;
           }
           try {
-            streamEl.empty();
-            const src = this.backingFile?.path ?? SCRATCH_PATH;
             if (error) {
-              await MarkdownRenderer.render(this.app, `⚠️ ${error}`, streamEl, src, this);
+              await stream.finish(`**Error:** ${error}`);
             } else {
               const transcription = (finalText || streamed).trim();
               const cur = this.editorEl.value;
@@ -856,17 +1117,11 @@ class ClaudeNotebookView extends ItemView {
                 cur + `${sep}\n---\n*Transcribed image:* ![[${imgName}]]\n\n${transcription}\n`;
               await this.saveNow();
               this.refreshEditorView();
-              await MarkdownRenderer.render(
-                this.app,
-                "✅ Transcribed the image into the note.",
-                streamEl,
-                src,
-                this,
-              );
-              this.recordClaude("✅ Transcribed the image into the note.");
+              await stream.finish("Transcribed the image into the note.");
+              this.recordClaude("Transcribed the image into the note.");
             }
-            this.scrollThread();
           } finally {
+            if (this.activeStream === stream) this.activeStream = null;
             this.setBusy(false);
           }
         },
@@ -879,7 +1134,12 @@ class ClaudeNotebookView extends ItemView {
     if (empty) this.threadBodyEl.empty();
     const msg = this.threadBodyEl.createDiv({ cls: "cn-msg cn-msg-claude" });
     msg.createDiv({ cls: "cn-msg-role", text: "claude" });
-    const textEl = msg.createDiv({ cls: "cn-msg-text", text: "…" });
+    const textEl = msg.createDiv({ cls: "cn-msg-text" });
+    // Real typing indicator until the first token arrives (the first setText() replaces it).
+    const typing = textEl.createDiv({ cls: "cn-typing" });
+    typing.createSpan({ cls: "cn-dot" });
+    typing.createSpan({ cls: "cn-dot" });
+    typing.createSpan({ cls: "cn-dot" });
     this.threadBodyEl.scrollTop = this.threadBodyEl.scrollHeight;
     return textEl;
   }
@@ -888,11 +1148,16 @@ class ClaudeNotebookView extends ItemView {
     this.busy = b;
     if (b) this.turnCancelled = false;
     this.promptEl.disabled = b;
+    if (this.composerEl) this.composerEl.setAttr("data-busy", b ? "true" : "false");
+    // In edit mode Claude rewrites the bound note — lock the textarea so mid-turn typing isn't lost.
+    const editTurn = b && this.mode === "edit";
+    if (this.editorEl) this.editorEl.readOnly = editTurn;
+    if (this.noteBadge) this.noteBadge.setText(editTurn ? "Claude is writing…" : "");
     this.promptEl.placeholder = b
-      ? "Claude is working…  (■ to stop)"
+      ? "Claude is working…  (Esc or Stop to cancel)"
       : "Ask, quiz me, or request an edit…  (Enter to send · Shift+Enter for newline)";
     if (this.sendBtn) {
-      this.sendBtn.setText(b ? "■" : "➤");
+      setIcon(this.sendBtn, b ? "square" : "send");
       this.sendBtn.toggleClass("cn-stop", b);
       this.sendBtn.setAttr("aria-label", b ? "Stop" : "Send");
     }
@@ -901,10 +1166,13 @@ class ClaudeNotebookView extends ItemView {
   private cancelTurn(): void {
     this.turnCancelled = true;
     this.engine.cancel();
+    this.activeStream?.cancel(); // stop the rAF loop; render what streamed, drop the caret
+    this.activeStream = null;
     this.setBusy(false);
-    const note = this.threadBodyEl.createDiv({ cls: "cn-undo" });
-    note.createSpan({ cls: "cn-undo-label", text: "⏹ Stopped." });
-    this.scrollThread();
+    this.setNotice("info", (bar) => {
+      const stopped = bar.createSpan({ cls: "cn-undo-label" });
+      iconLabel(stopped, "square", "Stopped.");
+    });
   }
 
   private vaultPath(): string {
@@ -991,6 +1259,19 @@ class ClaudeNotebookView extends ItemView {
 
   // ── backing file (dynamic; real persistence) ───────────────────────────────
 
+  /** Create a file, first creating its parent folder if missing (vault.create won't). */
+  private async createFile(p: string, seed: string): Promise<TFile> {
+    const dir = p.split("/").slice(0, -1).join("/");
+    if (dir && !this.app.vault.getAbstractFileByPath(dir)) {
+      try {
+        await this.app.vault.createFolder(dir);
+      } catch {
+        /* already exists / race — vault.create will report a real failure */
+      }
+    }
+    return this.app.vault.create(p, seed);
+  }
+
   private async loadBackingFile(): Promise<void> {
     // flush & cancel any pending save for the OUTGOING note before switching
     if (this.saveTimer) {
@@ -1000,27 +1281,34 @@ class ClaudeNotebookView extends ItemView {
     if (this.backingFile) await this.saveNow();
 
     const { vault } = this.app;
-    let file = vault.getAbstractFileByPath(this.backingPath);
-    if (!(file instanceof TFile)) {
-      if (this.backingPath === SCRATCH_PATH) {
-        file = await vault.create(SCRATCH_PATH, SCRATCH_SEED);
-      } else {
-        // bound file vanished — fall back to scratch
-        new Notice(`Claude Notebook: ${this.backingPath} not found — opening scratch.`);
-        this.backingPath = SCRATCH_PATH;
-        file = vault.getAbstractFileByPath(SCRATCH_PATH);
-        if (!(file instanceof TFile)) {
-          file = await vault.create(SCRATCH_PATH, SCRATCH_SEED);
+    try {
+      let file = vault.getAbstractFileByPath(this.backingPath);
+      if (!(file instanceof TFile)) {
+        if (this.backingPath === SCRATCH_PATH) {
+          file = await this.createFile(SCRATCH_PATH, SCRATCH_SEED);
+        } else {
+          // bound file vanished — fall back to scratch
+          new Notice(`Claude Notebook: ${this.backingPath} not found — opening scratch.`);
+          this.backingPath = SCRATCH_PATH;
+          file = vault.getAbstractFileByPath(SCRATCH_PATH);
+          if (!(file instanceof TFile)) {
+            file = await this.createFile(SCRATCH_PATH, SCRATCH_SEED);
+          }
         }
       }
+      this.backingFile = file as TFile;
+      this.editorEl.value = await vault.read(this.backingFile);
+    } catch (e) {
+      new Notice(`Claude Notebook couldn't open its note: ${String(e)}`);
+      this.editorEl.value = "";
+      this.backingFile = null;
     }
-    this.backingFile = file as TFile;
-    this.editorEl.value = await vault.read(this.backingFile);
     this.refreshEditorView();
     // restore this note's saved conversation (thread + session)
     const convo = this.plugin.getConvo(this.backingPath);
     this.messages = convo?.messages ? convo.messages.slice() : [];
     this.sessionId = convo?.sessionId ?? null;
+    this.sessionMode = null; // a freshly loaded session re-mints its system prompt on first turn
     this.renderThread();
   }
 
@@ -1169,6 +1457,17 @@ class ClaudeNotebookSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Pin study presets")
+      .setDesc("Show the six study actions as a permanent row above the composer instead of only in the ✦ menu.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.cfg.pinPresets).onChange(async (v) => {
+          this.plugin.cfg.pinPresets = v;
+          await this.plugin.saveSettings();
+          new Notice("Reopen the Claude Notebook view to apply.");
+        }),
+      );
+
+    new Setting(containerEl)
       .setName("Desk auto-focus")
       .setDesc("Study Desk: single-click a card to grow it to reading size; click elsewhere to shrink it back.")
       .addToggle((t) =>
@@ -1218,6 +1517,24 @@ export default class ClaudeNotebookPlugin extends Plugin {
   /** Persist immediately (the conversation cache uses a debounced path at saveData). */
   async saveSettings(): Promise<void> {
     await this.saveData(this.cnData);
+  }
+
+  /** Flush the debounced conversation save now — called on view close and plugin unload
+   *  so the last exchange (and its session id) isn't lost inside the 600ms debounce window. */
+  async flush(): Promise<void> {
+    if (this.persistTimer) {
+      window.clearTimeout(this.persistTimer);
+      this.persistTimer = null;
+    }
+    await this.saveData(this.cnData);
+  }
+
+  onunload(): void {
+    // Remove any Study-Desk toolbars + marker classes injected into canvas views so they
+    // don't linger orphaned, calling into a torn-down instance after disable/update.
+    document.querySelectorAll(".cn-desk-toolbar").forEach((el) => el.remove());
+    document.querySelectorAll(".cn-desk-canvas").forEach((el) => el.classList.remove("cn-desk-canvas"));
+    void this.flush(); // best-effort final save of any pending conversation
   }
 
   async onload(): Promise<void> {
@@ -1463,7 +1780,7 @@ export default class ClaudeNotebookPlugin extends Plugin {
         const n = this.deskNodeAt(c, e.target as HTMLElement);
         if (!n?.file) return;
         if (this.deskIsPinned(n)) {
-          new Notice("📍 Pinned — unpin to resize (Ctrl+Shift+P).");
+          new Notice("Pinned — unpin to resize (Ctrl+Shift+P).");
           return;
         }
         e.preventDefault();
@@ -1498,11 +1815,11 @@ export default class ClaudeNotebookPlugin extends Plugin {
       this.app.workspace.on("file-menu", (menu, file) => {
         if (file instanceof TFile) {
           menu.addItem((i) =>
-            i.setTitle("📌 Add to Study Desk").setIcon("pin").onClick(() => void this.addFileToDesk(file.path)),
+            i.setTitle("Add to Study Desk").setIcon("pin").onClick(() => void this.addFileToDesk(file.path)),
           );
         } else if (file instanceof TFolder) {
           menu.addItem((i) =>
-            i.setTitle("📌 Add folder to Study Desk (in order)").setIcon("pin").onClick(() => void this.addFolderToDesk(file)),
+            i.setTitle("Add folder to Study Desk (in order)").setIcon("pin").onClick(() => void this.addFolderToDesk(file)),
           );
         }
       }),
@@ -1567,13 +1884,13 @@ export default class ClaudeNotebookPlugin extends Plugin {
       });
       this.addWikilinkEdges(desk); // wire the new card to related md cards, graph-style
       await this.deskApplyData(c0, desk);
-      new Notice(`📌 → Study Desk (${desk.nodes.length} item${desk.nodes.length === 1 ? "" : "s"})`);
+      new Notice(`Added to Study Desk (${desk.nodes.length} item${desk.nodes.length === 1 ? "" : "s"})`);
     }
     await this.openDesk();
   }
 
   /** Reveal an open Desk leaf, else open the Desk in a new tab. */
-  private async openDesk(): Promise<void> {
+  async openDesk(): Promise<void> {
     for (const leaf of this.app.workspace.getLeavesOfType("canvas")) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       if ((leaf.view as any).file?.path === this.deskPath) {
@@ -1646,7 +1963,7 @@ export default class ClaudeNotebookPlugin extends Plugin {
     this.addWikilinkEdges(desk);
     await this.deskApplyData(c0, desk);
     if (files.length > 30) new Notice(`Folder has ${files.length} files — first 30 added.`);
-    new Notice(`📌 ${folder.name}: ${placed} card(s) added in order${skipped ? ` (${skipped} already there)` : ""}`);
+    new Notice(`${folder.name}: ${placed} card(s) added in order${skipped ? ` (${skipped} already there)` : ""}`);
     await this.openDesk();
   }
 
@@ -1762,7 +2079,7 @@ export default class ClaudeNotebookPlugin extends Plugin {
       }
       const added = this.addWikilinkEdges(desk);
       if (added) await this.deskApplyData(c, desk);
-      if (!quiet) new Notice(added ? `⛓ Linked ${added} related pair(s)` : "No unlinked wikilink pairs on the Desk.");
+      if (!quiet) new Notice(added ? `Linked ${added} related pair(s)` : "No unlinked wikilink pairs on the Desk.");
     } finally {
       this.deskLinking = false;
     }
@@ -2246,7 +2563,7 @@ export default class ClaudeNotebookPlugin extends Plugin {
       }
     }
     await this.deskApplyData(c, desk);
-    new Notice(pinned ? `📍 Pinned ${pinned} card(s) at current size` : `Unpinned ${unpinned} card(s)`);
+    new Notice(pinned ? `Pinned ${pinned} card(s) at current size` : `Unpinned ${unpinned} card(s)`);
   }
 
   /** The Desk card whose DOM contains this element, if any. */
@@ -2266,30 +2583,30 @@ export default class ClaudeNotebookPlugin extends Plugin {
     const v = leaf.view as any;
     if (v?.getViewType?.() !== "canvas" || v.file?.path !== this.deskPath) return;
     const host = v.containerEl as HTMLElement;
+    host.addClass("cn-desk-canvas"); // scopes the desk-only card CSS to this one canvas
     if (host.querySelector(".cn-desk-toolbar")) return;
     const bar = host.createDiv({ cls: "cn-desk-toolbar" });
-    bar.style.cssText =
-      "position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:30;display:flex;gap:5px;align-items:center;background:var(--background-secondary);border:1px solid var(--background-modifier-border);border-radius:12px;padding:4px 8px;opacity:.92;box-shadow:var(--shadow-s)";
-    const btn = (label: string, title: string, fn: () => void): void => {
-      const b = bar.createEl("button", { text: label });
+    const btn = (icon: string, title: string, fn: () => void): void => {
+      const b = bar.createEl("button", { cls: "cn-btn cn-btn--icon" });
+      setIcon(b, icon);
       b.setAttr("title", title);
-      b.style.cssText = "font-size:.78em;padding:2px 9px;cursor:pointer;border-radius:8px";
+      b.setAttr("aria-label", title);
       b.onclick = fn;
     };
-    btn("▦ Grid", "3-across grid (Ctrl+Shift+1)", () => void this.deskPreset("grid"));
-    btn("▭ Row", "Reading row (Ctrl+Shift+2)", () => void this.deskPreset("row"));
-    btn("◰ Focus", "Focus + sidebar (Ctrl+Shift+3)", () => void this.deskPreset("focus"));
-    btn("🕸 Graph", "Arrange by wikilinks, like graph view (Ctrl+Shift+4)", () => void this.deskPreset("graph"));
-    btn("🗕 Min", "Minimize all but focused/selected (Ctrl+Shift+M)", () => {
+    btn("layout-grid", "3-across grid (Ctrl+Shift+1)", () => void this.deskPreset("grid"));
+    btn("rectangle-horizontal", "Reading row (Ctrl+Shift+2)", () => void this.deskPreset("row"));
+    btn("scan", "Focus + sidebar (Ctrl+Shift+3)", () => void this.deskPreset("focus"));
+    btn("share-2", "Arrange by wikilinks, like graph view (Ctrl+Shift+4)", () => void this.deskPreset("graph"));
+    btn("minimize-2", "Minimize all but focused/selected (Ctrl+Shift+M)", () => {
       this.deskSuppressUntil = Date.now() + 450; // toolbar click deselects — don't let the tick restore first
       void this.deskMinimize("others");
     });
-    btn("↺ All", "Restore minimized (Ctrl+Shift+0)", () => {
+    btn("maximize-2", "Restore minimized (Ctrl+Shift+0)", () => {
       this.deskSuppressUntil = Date.now() + 450;
       void this.deskMinimize("restore");
     });
-    btn("⛓ Link", "Draw edges between cards that wikilink each other", () => void this.deskLinkRelated());
-    btn("📍 Pin", "Pin/unpin selected at current size (Ctrl+Shift+P)", () => {
+    btn("link", "Draw edges between cards that wikilink each other", () => void this.deskLinkRelated());
+    btn("pin", "Pin/unpin selected at current size (Ctrl+Shift+P)", () => {
       this.deskSuppressUntil = Date.now() + 450;
       void this.deskTogglePin();
     });

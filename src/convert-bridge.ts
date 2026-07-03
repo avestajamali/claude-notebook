@@ -71,8 +71,13 @@ export function convertToMarkdown(file: string, opts: ConvertOpts): Promise<Conv
     let err = "";
 
     const timer = setTimeout(() => {
+      // On Windows, python spawns Office/COM grandchildren — kill the whole tree, not just python.
       try {
-        child.kill();
+        if (process.platform === "win32" && typeof child.pid === "number") {
+          spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
+        } else {
+          child.kill();
+        }
       } catch {
         /* best effort */
       }
