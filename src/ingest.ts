@@ -24,7 +24,10 @@ async function ingestIcs(app: App, absPath: string, eventsFolder: string): Promi
   let last = "";
   for (const ev of events) {
     const safe = ev.title.replace(/[\\/:*?"<>|#^[\]]+/g, "").trim().slice(0, 80) || "Event";
-    const p = normalizePath(`${eventsFolder}/${ev.date} ${safe}.md`);
+    // Include the start time (HH-MM; ':' is Windows-invalid) so two same-day, same-title events
+    // at different times don't collide onto one note and silently drop the second.
+    const timeTag = ev.startTime ? ev.startTime.replace(":", "") : "allday";
+    const p = normalizePath(`${eventsFolder}/${ev.date} ${timeTag} ${safe}.md`);
     if (await app.vault.adapter.exists(p)) {
       skipped++;
       continue;
@@ -53,7 +56,7 @@ async function ingestIcs(app: App, absPath: string, eventsFolder: string): Promi
 }
 
 /**
- * Component A — drop-anything ingestion.
+ * Drop-to-ingest — drop-anything ingestion.
  *
  * Every file/link that enters the agent is PERSISTED, always:
  *   - a readable .md note in <droppedNotesPath>/        (git-ignored, Obsidian-indexed)
@@ -99,9 +102,11 @@ function sha1Str(s: string): string {
   return crypto.createHash("sha1").update(s, "utf8").digest("hex");
 }
 
-/** Filesystem-safe note basename: original stem + a short hash, so collisions never overwrite. */
+/** Filesystem-safe note basename: original stem + a short hash, so collisions never overwrite.
+ *  Clamp the stem — a 150-char Canvas-export name under the OneDrive vault root would otherwise
+ *  breach Windows MAX_PATH and fail the write after the binary was already archived. */
 function noteName(stem: string, hash8: string): string {
-  const safe = stem.replace(/[\\/:*?"<>|]+/g, "_").trim() || "file";
+  const safe = (stem.replace(/[\\/:*?"<>|]+/g, "_").trim() || "file").slice(0, 80);
   return `${safe} (${hash8}).md`;
 }
 
@@ -125,11 +130,6 @@ async function ensureFolder(app: App, vaultRel: string): Promise<void> {
       /* concurrent create — fine */
     }
   }
-}
-
-function frontmatter(fields: Record<string, string | number>): string {
-  const lines = Object.entries(fields).map(([k, v]) => `${k}: ${typeof v === "string" ? JSON.stringify(v) : v}`);
-  return `---\n${lines.join("\n")}\n---\n`;
 }
 
 /** Dedup lookup across category folders: the note whose name carries this hash prefix. */
@@ -163,12 +163,23 @@ export async function ingestFile(app: App, cfg: IngestConfig, absPath: string): 
     const filesRel = `${notesRel}/_files`;
     await ensureFolder(app, notesRel);
 
-    // Dedup: if this exact content is already archived, reuse its note wherever it lives.
+    // Dedup: if a note for this exact content already exists ANYWHERE, reuse it and NEVER
+    // rewrite it — it may carry the user's edits or a nightly-enriched summary. Check the note's
+    // existence directly (not the archived binary): pruning _files/ must not turn a re-drop into a
+    // silent overwrite of the surviving, possibly-edited note.
     const originalRel = `_files/${hash}${e}`;
     const originalAbs = path.join(base, normalizePath(filesRel), `${hash}${e}`);
-    if (fs.existsSync(originalAbs)) {
-      const existing = findNoteByHash(app, notesRel, hash8);
-      if (existing) return { ok: true, notePath: existing, deduped: true, blurb: `Already ingested: [[${existing}]]` };
+    const existing = findNoteByHash(app, notesRel, hash8);
+    if (existing) {
+      if (!fs.existsSync(originalAbs)) {
+        try {
+          fs.mkdirSync(path.dirname(originalAbs), { recursive: true });
+          fs.copyFileSync(absPath, originalAbs); // re-archive the missing binary; leave the note alone
+        } catch {
+          /* best effort — the note is what matters */
+        }
+      }
+      return { ok: true, notePath: existing, deduped: true, blurb: `Already ingested: [[${existing}]]` };
     }
 
     // Archive the original (binary-safe copy via node fs).
@@ -219,6 +230,10 @@ export async function ingestFile(app: App, cfg: IngestConfig, absPath: string): 
     const noteType = quality === "failed" ? "stub" : noteTypeOf(e, tier >= 0);
     const cls = classify(path.basename(absPath), absPath, body);
     const sensitive = detectSensitive(`${path.basename(absPath)}\n${body}`);
+    // seedSummary's digit mask only catches card-style runs; a TFN/BSB could still leak into the
+    // summary metadata. When the note is flagged sensitive, drop the seed summary entirely and
+    // let the (sensitive-aware) nightly enrich decide — never surface raw lead text.
+    const summary = sensitive ? "" : seedSummary(body);
     const confident = cls.confidence >= 0.5;
     const catRel = `${notesRel}/${cls.category.folder}`;
     await ensureFolder(app, catRel);
@@ -231,7 +246,7 @@ export async function ingestFile(app: App, cfg: IngestConfig, absPath: string): 
       confidence: cls.confidence,
       tags: seedTags(cls.category.slug, path.basename(absPath), noteType),
       status: confident && noteType !== "stub" ? "active" : "inbox",
-      summary: seedSummary(body),
+      summary,
       sensitive,
       size_bytes: size,
       size: displaySize(size),
@@ -252,7 +267,7 @@ export async function ingestFile(app: App, cfg: IngestConfig, absPath: string): 
       `> [!quote] Source`,
       `> \`${absPath}\` — ingested ${today()} (${how}). Original: [\`${originalRel}\`](${encodeURI(`${notesRel}/${originalRel}`)})`,
       "",
-      `> [!tldr] ${seedSummary(body) || "(pending nightly enrich)"}`,
+      `> [!tldr] ${summary || "(pending nightly enrich)"}`,
       "",
       // PDFs: embed the original so the note (and its canvas card) shows the real
       // rendered document above the extracted text. Zero tokens — Obsidian's viewer.
@@ -299,7 +314,19 @@ export async function ingestLink(app: App, cfg: IngestConfig, url: string): Prom
       return { ok: true, notePath, deduped: true, blurb: `Already saved: [[${notePath}]]` };
     }
 
-    const fm = frontmatter({ source: url, type: "link", hash: sha1Str(url), ingested: today(), category: "uncategorized" });
+    // Build with the schema-v1 serializer (not the old local helper) so link notes carry
+    // title/status/schema_version — otherwise the frontmatter linter permanently flags them and
+    // the nightly enrich (which requires status:inbox + schema_version) never touches them.
+    const fm = buildFrontmatter({
+      title: stem,
+      type: "link",
+      category: "uncategorized",
+      hash: sha1Str(url),
+      source: url,
+      status: "inbox",
+      ingested: today(),
+      schema_version: 1,
+    });
     const content = `${fm}\n# ${title}\n\n*Saved ${today()} from ${url}*\n\n${md}\n`;
     await app.vault.create(notePath, content);
     return { ok: true, notePath, blurb: `Saved → [[${notePath}]]` };

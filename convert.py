@@ -8,7 +8,7 @@ local text extraction is genuinely insufficient.
 Design principle
 ----------------
 A converted file is read by a SUBAGENT, never the main loop, and the result is
-cached in a local .cache/ folder so it is never re-converted.
+cached in .cache/ so it is never re-converted.
 
 Tier ladder (auto-selected per file)
 ------------------------------------
@@ -46,6 +46,7 @@ Dependencies (all already installed):
     Microsoft Office (for Tier-1 COM conversion of legacy formats)
 """
 
+import hashlib
 import json
 import re
 import subprocess
@@ -56,9 +57,21 @@ SCRIPT_DIR = Path(__file__).parent
 CACHE_DIR = SCRIPT_DIR / ".cache"
 CACHE_DIR.mkdir(exist_ok=True)
 
+
+def _content_key(path: Path) -> str:
+    """Cache key = stem + a short content hash, so two different files that share a
+    basename (e.g. 'Lecture 1.pdf' from two subjects, or a re-dropped file whose
+    content changed) never collide onto one cache entry and return each other's text.
+    Falls back to a path-based key if the file can't be read."""
+    try:
+        h = hashlib.sha1(path.read_bytes()).hexdigest()[:8]
+    except Exception:
+        h = hashlib.sha1(str(path.resolve()).encode("utf-8", "replace")).hexdigest()[:8]
+    return f"{path.stem}.{h}"
+
 # ── Tier classification ─────────────────────────────────────────────────────
 
-TIER0_EXT = {".pptx", ".docx", ".xlsx", ".xlsm", ".csv", ".html", ".htm", ".md", ".txt"}
+TIER0_EXT = {".pptx", ".docx", ".xlsx", ".xlsm", ".csv", ".tsv", ".html", ".htm", ".md", ".txt"}
 TIER1_EXT = {".ppt", ".doc", ".xls"}
 TIER2_EXT = {".pdf"}
 TIER4_EXT = {".h5p", ".mov", ".mp4", ".m4a", ".mp3", ".wav", ".rdata", ".rds"}
@@ -188,7 +201,7 @@ def _com_convert(path: Path) -> Path | None:
     if ext not in mapping:
         return None
     app, fmt, new_ext = mapping[ext]
-    dst = CACHE_DIR / (path.stem + new_ext)
+    dst = CACHE_DIR / (_content_key(path) + new_ext)
     if dst.exists():
         return dst
 
@@ -224,13 +237,14 @@ def render_pdf_pages(path: Path, pages: list[int] | None = None, dpi: int = 150)
     import fitz  # PyMuPDF
     doc = fitz.open(str(path))
     out_paths = []
+    key = _content_key(path)
     page_indices = [p - 1 for p in pages] if pages else range(len(doc))
     for i in page_indices:
         if i < 0 or i >= len(doc):
             continue
         page = doc[i]
         pix = page.get_pixmap(dpi=dpi)
-        png_path = CACHE_DIR / f"{path.stem}_p{i+1}.png"
+        png_path = CACHE_DIR / f"{key}_p{i+1}.png"
         pix.save(str(png_path))
         out_paths.append(png_path)
     doc.close()
@@ -275,18 +289,26 @@ def convert_to_markdown(path: Path) -> dict:
                 "notes": "Textbook chapter — pointer stub only (too large to inline)."}
 
     tier = classify(path)
-    cache_md = CACHE_DIR / (path.stem + ".md")
+    cache_md = CACHE_DIR / (_content_key(path) + ".md")
 
     # Tier 4: cannot convert
     if tier == 4:
         return {"tier": 4, "md_path": None, "md_text": None, "quality": "pointer",
                 "notes": f"{path.suffix} cannot be converted to text — pointer stub only."}
 
-    # Cache hit
+    # Cache hit — re-judge quality from the cached text (never hardcode "ok", or an
+    # image-only PDF that first extracted "poor" would silently report a good text layer
+    # on every later read and skip the visual-read escalation).
     if cache_md.exists():
         text = cache_md.read_text(encoding="utf-8")
-        return {"tier": tier, "md_path": str(cache_md), "md_text": text,
-                "quality": "ok", "notes": "Loaded from cache."}
+        n_pages = pdf_page_count(path) if tier == 2 else max(1, text.count("<!-- Slide number"))
+        q = extraction_quality(text, n_pages)
+        quality = "ok" if q["ok"] else "poor"
+        result = {"tier": tier, "md_path": str(cache_md), "md_text": text,
+                  "quality": quality, "notes": "Loaded from cache."}
+        if quality == "poor" and tier == 2:
+            result["render_hint"] = list(range(1, n_pages + 1))
+        return result
 
     # Tier 1: legacy Office -> modern -> markitdown
     if tier == 1:
@@ -301,7 +323,9 @@ def convert_to_markdown(path: Path) -> dict:
             return {"tier": 1, "md_path": None, "md_text": None, "quality": "failed",
                     "notes": f"markitdown failed on converted file: {e}"}
         cache_md.write_text(text, encoding="utf-8")
-        q = extraction_quality(text)
+        # Judge per-slide (matching the tier-0 fresh path and the cache-hit re-judge), so a
+        # slide deck's quality label doesn't flip between first conversion and later cache hits.
+        q = extraction_quality(text, max(1, text.count("<!-- Slide number")))
         return {"tier": 1, "md_path": str(cache_md), "md_text": text,
                 "quality": "ok" if q["ok"] else "poor",
                 "notes": f"Converted via COM then markitdown. {q}"}

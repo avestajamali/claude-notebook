@@ -24,7 +24,7 @@ import * as os from "os";
 import * as path from "path";
 
 import { ingestFile, ingestLink } from "./ingest";
-import { CATEGORIES, Category } from "./facility";
+import { CATEGORIES, Category, setUserCategoryRules } from "./facility";
 
 /**
  * Set a button/label's content to a Lucide icon plus an optional text label.
@@ -60,7 +60,7 @@ function filePathOf(f: File): string | null {
 import { extractLeafContent } from "./leaf-context";
 import { rescueDryRun, scanDownloads } from "./organizer";
 import { composeTeachRequest, recordTeachSession } from "./teach";
-import { DEFAULT_AVAILABILITY } from "./scheduler";
+import { DEFAULT_AVAILABILITY, readMastery } from "./scheduler";
 
 import { ClaudeEngine } from "./engine";
 import { StreamRenderer } from "./stream-renderer";
@@ -73,11 +73,6 @@ const SCRATCH_SEED = "# 🤖 Claude Notebook\n\n";
 const STUDY_PREFIX = "Study/";
 const SUBJECTS_RE = /\/Subjects\/([^/]+)\//;
 
-/**
- * Optional map from a subject folder name to a course code + tag. Empty by default;
- * populate it (or leave it empty) to suit your own vault — nothing here is hardcoded
- * to a particular institution.
- */
 const SUBJECT_MAP: Record<string, { code: string; tag: string }> = {};
 
 type StudyType = "practice" | "summary" | "flashcards" | "cheatsheet" | "notes";
@@ -103,6 +98,9 @@ const TYPE_GUIDANCE: Record<StudyType, string> = {
     "clear teaching notes: plain-English explanations, the lecturer's worked examples with the actual numbers, and callouts for key insights and common traps.",
 };
 
+/** Deepest run of Claude edits that can be walked back (in-memory pre-edit snapshots). */
+const UNDO_STACK_MAX = 10;
+
 /** Local (not UTC) date as YYYY-MM-DD — Melbourne late-night was rolling back a day under UTC. */
 function localDate(): string {
   const d = new Date();
@@ -117,6 +115,8 @@ interface ChatMsg {
 interface StoredConvo {
   sessionId: string | null;
   messages: ChatMsg[];
+  /** Ordered paths of the pinned context notes — the tray restores with the conversation. */
+  contextPaths?: string[];
 }
 interface CnData {
   conversations: Record<string, StoredConvo>;
@@ -129,14 +129,8 @@ interface CnData {
  * so an old data.json (conversations only) still loads.
  */
 interface CnSettings {
-  /** Reasoning/analysis ceiling — hard analysis on both Pro and Max. */
-  model: string;
-  /** Everyday workhorse — most interactive work; protects Opus budget on Pro. */
-  routineModel: string;
-  /** Cheap tier — classify / route / distill-on-ingest. */
+  /** Cheap tier for the background enrich pass — classify / route / distill-on-ingest. */
   subAgentModel: string;
-  /** On Pro, fence Opus to heavy task-classes so casual turns can't drain the weekly cap. */
-  opusBudgetGuard: boolean;
   /** Hard cap on tokens injected into a single turn (distill above this). */
   maxInjectTokens: number;
   /** Python interpreter for the convert.py bridge. */
@@ -149,18 +143,18 @@ interface CnSettings {
   droppedNotesPath: string;
   /** Sorted-output wrapper folder name inside Downloads. */
   sortedWrapper: string;
-  /** Vault-relative path to the routing-guide note (intent -> folder map). */
-  routingGuidePath: string;
-  /** zero-token drop contract: when the Haiku polish runs. Drop path never calls the model. */
-  enrichMode: "nightly" | "immediate" | "off";
+  /** Zero-token drop contract: when the Haiku polish runs. Drop path never calls the model. */
+  enrichMode: "nightly" | "off";
   /** Drop an OS file ANYWHERE in Obsidian → ingest + catalogue (replaces the attach-to-note default). */
   globalDropIngest: boolean;
-  /** M4 move toggle (default OFF, plan trust period): nightly sweep may MOVE Downloads into the store. */
+  /** Move toggle (default OFF during the trust period): nightly sweep may MOVE Downloads into the store. */
   sweepMove: boolean;
   /** Local date (YYYY-MM-DD) the nightly maintenance last ran — catch-up style, not a literal 3am cron. */
   lastNightlyRun: string;
   /** Study Desk: single-clicking a card grows it to reading size; deselect shrinks it back. */
   deskAutoFocus: boolean;
+  /** When ON, the Notebook rebinds to whatever note you focus (default OFF — stable workbench). */
+  followActiveNote: boolean;
   /** UI: note drawer open state + height (px), persisted across sessions. */
   noteDrawerOpen: boolean;
   noteDrawerHeight: number;
@@ -168,32 +162,37 @@ interface CnSettings {
   pinPresets: boolean;
   /** UI: last-used study preset floats to the top of the ✦ menu. */
   lastPreset: string;
+  /** Vault-relative path to a note whose content is appended to Claude's system prompt each
+   *  session (the user's voice/formatting conventions). "" disables it. */
+  styleGuideNotePath: string;
+  /** Vault-relative path to a note of custom ingest-classification rules, consulted before the
+   *  built-in categories. "" = built-in categories only. */
+  routingGuidePath: string;
 }
 
 const DEFAULT_SETTINGS: CnSettings = {
-  model: "claude-opus-4-8",
-  routineModel: "claude-sonnet-4-6",
   subAgentModel: "claude-haiku-4-5",
-  opusBudgetGuard: true,
   maxInjectTokens: 6000,
   pythonPath: "python",
   convertPyPath: "",
   downloadsPath: path.join(os.homedir(), "Downloads"),
   droppedNotesPath: "Dropped Notes",
   sortedWrapper: "_Sorted",
-  routingGuidePath: "Everything App/Routing Guide.md",
   enrichMode: "nightly",
   globalDropIngest: true,
   sweepMove: false,
   lastNightlyRun: "",
   deskAutoFocus: true,
+  followActiveNote: false,
   noteDrawerOpen: false,
   noteDrawerHeight: 260,
   pinPresets: false,
   lastPreset: "",
+  styleGuideNotePath: "",
+  routingGuidePath: "",
 };
 
-type Mode = "chat" | "edit" | "quiz";
+type Mode = "chat" | "edit" | "quiz" | "ask";
 
 interface CnViewState {
   filePath?: string;
@@ -202,7 +201,7 @@ interface CnViewState {
 /**
  * The fused Notebook view, bound to a DYNAMIC backing file:
  *  - the home-base scratch, a Study note, or a per-lecture working copy.
- * Layout: editor (the bound file) · collapsible chat thread · prompt bar (engine in S2).
+ * Layout: editor (the bound file) · collapsible chat thread · prompt bar.
  */
 class ClaudeNotebookView extends ItemView {
   private editorEl!: HTMLTextAreaElement;
@@ -223,9 +222,25 @@ class ClaudeNotebookView extends ItemView {
   private modeCaption!: HTMLElement;
   private noticeSlot!: HTMLElement;
   private noticeKind: "undo" | "info" | null = null;
+  /** Bounded LIFO of pre-edit snapshots — one entry per successful Claude edit turn. The
+   *  undo notice always mirrors the top; rebinding the workbench empties the whole stack. */
+  private undoStack: { file: TFile; snapshot: string; label: string }[] = [];
+  /** "Which note?" plumbing: the proactive nudge + the multi-note context tray. */
+  private contextHintEl!: HTMLElement;
+  private contextChipEl!: HTMLElement;
+  /** The pinned context notes, in insertion order — injected by path (never by body). */
+  private contextFiles: TFile[] = [];
+  /** Paths already primed into the CURRENT session; reset on every session reset. */
+  private contextSentPaths = new Set<string>();
+  /** A file the user dismissed the nudge for — don't re-nag until they view a different one. */
+  private dismissedHintPath: string | null = null;
+  private followTimer: number | null = null;
 
   private backingPath = SCRATCH_PATH;
   private backingFile: TFile | null = null;
+  /** The exact bytes last read from / written to the backing file — the baseline for
+   *  detecting an external (OneDrive/other-tab) change before an autosave overwrites it. */
+  private lastLoadedContent: string | null = null;
   private mode: Mode = "chat";
   private saveTimer: number | null = null;
   private writing = false;
@@ -263,6 +278,12 @@ class ClaudeNotebookView extends ItemView {
   }
 
   async setState(state: CnViewState, result: ViewStateResult): Promise<void> {
+    // openNotebookFor reuses an existing leaf, so setState can fire mid-turn (Ctrl+Shift+K/L,
+    // "Teach me this"). Unlike rebindTo/maybeFollow it isn't busy-guarded, so cancel any
+    // in-flight turn BEFORE the thread DOM is torn down — otherwise the engine keeps running,
+    // the stream renders into detached nodes, and the reply is silently dropped.
+    const changing = !!state?.filePath && state.filePath !== this.backingPath;
+    if (changing && this.busy) this.cancelTurn();
     if (state?.filePath) this.backingPath = state.filePath;
     await super.setState(state, result);
     if (this.editorEl) {
@@ -289,7 +310,7 @@ class ClaudeNotebookView extends ItemView {
     await this.loadBackingFile();
     this.updateTitle();
 
-    // Live sync: reflect external edits (a normal tab, or Claude in S2+) into this view.
+    // Live sync: reflect external edits (a normal tab, or Claude writing) into this view.
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
         if (file.path === this.backingPath && !this.writing) {
@@ -298,10 +319,16 @@ class ClaudeNotebookView extends ItemView {
       }),
     );
 
+    // "Which note?" — react to the user focusing a different note: follow it (mode on)
+    // or offer to attach it (mode off). file-open catches switching files within a leaf.
+    this.registerEvent(this.app.workspace.on("active-leaf-change", () => this.onActiveChanged()));
+    this.registerEvent(this.app.workspace.on("file-open", () => this.onActiveChanged()));
+    this.onActiveChanged(); // a note may already be open beside the freshly-summoned Notebook
+
     // Paste an image anywhere in the view → Claude transcribes it into the note.
     this.registerDomEvent(this.contentEl, "paste", (e) => void this.handlePaste(e));
 
-    // Drop a file or link anywhere in the view → ingest it.
+    // Drop a file or link anywhere in the view → ingest it (drop-to-ingest).
     // Only intercepts OS files and http(s) links; other drops fall through to Obsidian.
     this.registerDomEvent(this.contentEl, "dragover", (e) => {
       if (e.dataTransfer) e.preventDefault();
@@ -309,7 +336,7 @@ class ClaudeNotebookView extends ItemView {
     this.registerDomEvent(this.contentEl, "drop", (e) => void this.handleDrop(e));
   }
 
-  /** Component A: ingest dropped files/links, then surface them as context in the prompt. */
+  /** Drop-to-ingest: ingest dropped files/links, then surface them as context in the prompt. */
   private async handleDrop(e: DragEvent): Promise<void> {
     const dt = e.dataTransfer;
     if (!dt) return;
@@ -351,7 +378,7 @@ class ClaudeNotebookView extends ItemView {
     }
   }
 
-  /** Component B: inject external context (a read tab) into the prompt for the next turn. */
+  /** Send-tab: inject external context (a read tab) into the prompt for the next turn. */
   injectContext(text: string): void {
     if (!this.promptEl) return;
     const cur = this.promptEl.value;
@@ -361,10 +388,14 @@ class ClaudeNotebookView extends ItemView {
 
   async onClose(): Promise<void> {
     if (this.saveTimer) window.clearTimeout(this.saveTimer);
+    if (this.followTimer) window.clearTimeout(this.followTimer);
+    // If an edit turn is in flight, Claude may already have written the file; saveNow would
+    // overwrite it with the stale pre-edit buffer. Cancel the turn but leave the disk alone.
+    const editInFlight = this.busy && this.mode === "edit";
     this.engine.cancel();
     this.activeStream?.cancel(); // no rAF may survive the view — plugin unloads clean
     this.activeStream = null;
-    await this.saveNow();
+    if (!editInFlight) await this.saveNow();
     // Flush the debounced conversation save too, or a reply from the last ~600ms is lost.
     await this.plugin.flush();
     this.contentEl.empty();
@@ -372,13 +403,18 @@ class ClaudeNotebookView extends ItemView {
 
   // ── layout ────────────────────────────────────────────────────────────────
 
-  /** One slim header: icon + note name, a note-drawer toggle, and an overflow menu. */
+  /** One slim header: the binding button (icon + note name + ▾), a note-drawer toggle, overflow menu. */
   private buildHeader(root: HTMLElement): void {
     const bar = root.createDiv({ cls: "cn-header" });
-    const title = bar.createSpan({ cls: "cn-title" });
+    const title = bar.createEl("button", { cls: "cn-btn cn-title" });
+    title.setAttr("aria-label", "Choose which note Claude reads");
+    title.setAttr("title", "Choose which note Claude reads");
     const ic = title.createSpan({ cls: "cn-ic" });
     setIcon(ic, "book-open");
     this.titleEl = title.createSpan({ cls: "cn-title-text", text: "Claude Notebook" });
+    const chev = title.createSpan({ cls: "cn-ic cn-title-chevron" });
+    setIcon(chev, "chevron-down");
+    title.onclick = (e) => this.openBindingMenu(e);
 
     const actions = bar.createDiv({ cls: "cn-title-actions" });
     this.noteToggleBtn = actions.createEl("button", { cls: "cn-btn cn-btn--icon" });
@@ -404,6 +440,13 @@ class ClaudeNotebookView extends ItemView {
     this.titleEl.setText(this.backingFile?.basename ?? "Claude Notebook");
   }
 
+  /** Follow a rename/move of the bound note so this view keeps writing under the live path. */
+  onBackingRenamed(oldPath: string, newPath: string): void {
+    if (this.backingPath !== oldPath) return;
+    this.backingPath = newPath; // backingFile is the same TFile, already carrying newPath
+    this.updateTitle();
+  }
+
   /** Reset this note's conversation (thread + session) after confirmation-free single click. */
   private clearThread(): void {
     if (this.busy) {
@@ -413,8 +456,170 @@ class ClaudeNotebookView extends ItemView {
     this.messages = [];
     this.sessionId = null;
     this.sessionMode = null;
-    this.persist();
+    this.contextSentPaths.clear(); // fresh session must re-prime every pinned note
+    this.plugin.deleteConvo(this.backingPath); // drop the key, don't persist an empty husk
     this.renderThread();
+  }
+
+  // ── "which note does Claude read?" — binding + attached context ─────────────
+
+  /** The active markdown note the user is viewing, if it differs from the bound file. */
+  private computeCandidate(): TFile | null {
+    const f = this.app.workspace.getActiveFile();
+    if (!f || f.extension !== "md") return null; // non-md still available via "Send this tab" (Ctrl+Shift+J)
+    if (f.path === this.backingPath || f.path === SCRATCH_PATH) return null;
+    return f;
+  }
+
+  /** Header binding button: see/switch what Claude reads. */
+  private openBindingMenu(e: MouseEvent): void {
+    const menu = new Menu();
+    const cand = this.computeCandidate();
+    if (cand) {
+      menu.addItem((i) =>
+        i.setTitle(`Switch to “${cand.basename}”`).setIcon("arrow-left-right").onClick(() => void this.rebindTo(cand.path)),
+      );
+    }
+    if (this.backingPath !== SCRATCH_PATH) {
+      menu.addItem((i) => i.setTitle("Home (scratch workbench)").setIcon("home").onClick(() => void this.rebindTo(SCRATCH_PATH)));
+    }
+    menu.addSeparator();
+    menu.addItem((i) =>
+      i
+        .setTitle(this.plugin.cfg.followActiveNote ? "Stop following the active note" : "Follow the active note")
+        .setIcon("crosshair")
+        .setChecked(this.plugin.cfg.followActiveNote)
+        .onClick(async () => {
+          this.plugin.cfg.followActiveNote = !this.plugin.cfg.followActiveNote;
+          await this.plugin.saveSettings();
+          this.onActiveChanged();
+        }),
+    );
+    menu.showAtMouseEvent(e);
+  }
+
+  /** Rebind the workbench to a note (swaps its thread + session). Never mid-turn. */
+  private async rebindTo(path: string): Promise<void> {
+    if (this.busy) {
+      new Notice("Wait for the current turn to finish (or press Stop) first.");
+      return;
+    }
+    if (path === this.backingPath) return;
+    this.backingPath = path;
+    await this.loadBackingFile();
+    this.updateTitle();
+    this.clearContextHint();
+    this.refreshContextHint();
+  }
+
+  /** Focus changed: follow it (mode on) or offer to attach it (mode off). */
+  private onActiveChanged(): void {
+    if (this.plugin.cfg.followActiveNote) {
+      if (this.followTimer) window.clearTimeout(this.followTimer);
+      this.followTimer = window.setTimeout(() => void this.maybeFollow(), 250); // debounce fleeting focus
+    } else {
+      this.refreshContextHint();
+    }
+  }
+
+  private async maybeFollow(): Promise<void> {
+    if (this.busy) return; // never rebind under an in-flight turn
+    const f = this.computeCandidate();
+    if (!f || f.path === this.backingPath) return;
+    this.backingPath = f.path;
+    await this.loadBackingFile();
+    this.updateTitle();
+    this.clearContextHint();
+  }
+
+  /** Show/refresh the "you're viewing X" nudge (only when follow-mode is off). */
+  private refreshContextHint(): void {
+    if (!this.contextHintEl) return;
+    const f = this.plugin.cfg.followActiveNote ? null : this.computeCandidate();
+    // Don't nudge for a file already pinned to the tray, or one the user dismissed.
+    if (!f || this.contextFiles.some((p) => p.path === f.path) || f.path === this.dismissedHintPath) {
+      this.clearContextHint();
+      return;
+    }
+    this.contextHintEl.empty();
+    this.contextHintEl.removeClass("is-hidden");
+    const ic = this.contextHintEl.createSpan({ cls: "cn-ic" });
+    setIcon(ic, "file-text");
+    this.contextHintEl.createSpan({ cls: "cn-hint-text", text: `Viewing “${f.basename}”` });
+    const add = this.contextHintEl.createEl("button", { cls: "cn-btn cn-hint-add", text: "Add to chat" });
+    add.onclick = () => this.pinContext(f);
+    const sw = this.contextHintEl.createEl("button", { cls: "cn-btn cn-btn--icon" });
+    setIcon(sw, "arrow-left-right");
+    sw.setAttr("aria-label", "Switch the workbench to this note");
+    sw.setAttr("title", "Switch the workbench to this note");
+    sw.onclick = () => void this.rebindTo(f.path);
+    const x = this.contextHintEl.createEl("button", { cls: "cn-btn cn-btn--icon" });
+    setIcon(x, "x");
+    x.setAttr("aria-label", "Dismiss");
+    x.setAttr("title", "Dismiss");
+    x.onclick = () => {
+      this.dismissedHintPath = f.path;
+      this.clearContextHint();
+    };
+  }
+
+  private clearContextHint(): void {
+    if (!this.contextHintEl) return;
+    this.contextHintEl.empty();
+    this.contextHintEl.addClass("is-hidden");
+  }
+
+  /** Pin a note to the context tray (append, keep insertion order). Its PATH — not its body —
+   *  rides the next send, once per session; the agent Reads the live file. Idempotent. */
+  private pinContext(f: TFile): void {
+    if (!this.contextFiles.some((p) => p.path === f.path)) this.contextFiles.push(f);
+    this.dismissedHintPath = null;
+    this.clearContextHint();
+    this.renderContextChip();
+    this.persist(); // the working set restores with the conversation
+    this.promptEl.focus();
+  }
+
+  /** Remove just one pinned note; the rest of the tray (and their primed state) stay. */
+  private removeContext(f: TFile): void {
+    this.contextFiles = this.contextFiles.filter((p) => p.path !== f.path);
+    this.contextSentPaths.delete(f.path); // if re-pinned it must re-prime
+    this.renderContextChip();
+    this.persist();
+    this.refreshContextHint();
+  }
+
+  /** Open a fuzzy picker over the vault's markdown notes; the chosen note joins the tray. */
+  private openAddNotePicker(): void {
+    const view = this;
+    new (class extends FuzzySuggestModal<TFile> {
+      getItems(): TFile[] { return view.app.vault.getMarkdownFiles(); }
+      getItemText(f: TFile): string { return f.path; }
+      onChooseItem(f: TFile): void { view.pinContext(f); }
+    })(this.app).open();
+  }
+
+  /** Render the pinned notes as removable chips, plus a "+ Add note" control at the end. */
+  private renderContextChip(): void {
+    if (!this.contextChipEl) return;
+    this.contextChipEl.empty();
+    this.contextChipEl.removeClass("is-hidden");
+    for (const f of this.contextFiles) {
+      const chip = this.contextChipEl.createDiv({ cls: "cn-ctx-chip" });
+      const ic = chip.createSpan({ cls: "cn-ic" });
+      setIcon(ic, "paperclip");
+      chip.createSpan({ cls: "cn-ctx-name", text: f.basename });
+      const x = chip.createEl("button", { cls: "cn-btn cn-btn--icon cn-ctx-x" });
+      setIcon(x, "x");
+      x.setAttr("aria-label", `Remove ${f.basename} from context`);
+      x.setAttr("title", "Remove from context");
+      x.onclick = () => this.removeContext(f);
+    }
+    const add = this.contextChipEl.createEl("button", { cls: "cn-btn cn-ctx-add" });
+    iconLabel(add, "plus", "Add note");
+    add.setAttr("aria-label", "Pin a note to the context tray");
+    add.setAttr("title", "Pin a note to the context tray");
+    add.onclick = () => this.openAddNotePicker();
   }
 
   /** Generic icon+label segmented control; active state is matched on data-seg-value. */
@@ -484,17 +689,22 @@ class ClaudeNotebookView extends ItemView {
       const startH = wrap.getBoundingClientRect().height;
       const max = Math.max(160, root.clientHeight * 0.85);
       const onMove = (ev: PointerEvent) => {
+        if (ev.buttons === 0) return onUp(); // pointer released outside — don't drift on hover moves
         const h = Math.min(max, Math.max(96, startH + (ev.clientY - startY)));
         wrap.style.height = `${h}px`;
       };
       const onUp = () => {
         handle.removeEventListener("pointermove", onMove);
         handle.removeEventListener("pointerup", onUp);
+        handle.removeEventListener("pointercancel", onUp);
+        handle.removeEventListener("lostpointercapture", onUp);
         this.plugin.cfg.noteDrawerHeight = Math.round(wrap.getBoundingClientRect().height);
         void this.plugin.saveSettings();
       };
       handle.addEventListener("pointermove", onMove);
       handle.addEventListener("pointerup", onUp);
+      handle.addEventListener("pointercancel", onUp); // touch/pen takeover or OS interruption
+      handle.addEventListener("lostpointercapture", onUp);
     });
 
     this.applyEditMode();
@@ -505,7 +715,12 @@ class ClaudeNotebookView extends ItemView {
   private setNoteOpen(open: boolean, skipPersist = false): void {
     this.noteOpen = open;
     this.editorWrapEl.toggleClass("is-open", open);
-    this.editorWrapEl.style.height = open ? `${this.plugin.cfg.noteDrawerHeight || 260}px` : "";
+    // Clamp the restored height to the CURRENT pane: a height saved in a tall window would
+    // otherwise collapse the thread to 0 and push the composer off the bottom of a short panel.
+    const paneH = this.contentEl.clientHeight || 0;
+    const wanted = this.plugin.cfg.noteDrawerHeight || 260;
+    const h = paneH > 0 ? Math.min(wanted, Math.max(96, paneH * 0.6)) : wanted;
+    this.editorWrapEl.style.height = open ? `${h}px` : "";
     setIcon(this.noteToggleBtn, open ? "panel-top-close" : "panel-top-open");
     this.noteToggleBtn.setAttr("aria-label", open ? "Hide the note" : "Show the note");
     this.noteToggleBtn.setAttr("title", open ? "Hide the note" : "Show the note");
@@ -583,19 +798,23 @@ class ClaudeNotebookView extends ItemView {
   /** The anchor: one bordered card — notice slot above it, textarea, then a single action bar. */
   private buildComposer(root: HTMLElement): void {
     const outer = root.createDiv({ cls: "cn-composer-wrap" });
+    this.contextHintEl = outer.createDiv({ cls: "cn-context-hint is-hidden" });
     this.noticeSlot = outer.createDiv({ cls: "cn-notice-slot" });
     if (this.plugin.cfg.pinPresets) this.buildPresetRow(outer);
 
     const card = outer.createDiv({ cls: "cn-composer" });
     this.composerEl = card;
 
+    this.contextChipEl = card.createDiv({ cls: "cn-ctx-chip-row is-hidden" });
     this.promptEl = card.createEl("textarea", { cls: "cn-prompt" });
     this.promptEl.placeholder =
       "Ask, quiz me, or request an edit…  (Enter to send · Shift+Enter for newline)";
     this.promptEl.rows = 1;
     this.promptEl.addEventListener("input", () => this.autoGrow());
     this.promptEl.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey) {
+      // Skip the Enter that commits an IME composition (CJK): it arrives as keydown "Enter"
+      // with isComposing true (keyCode 229), and sending then fires a half-composed message.
+      if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
         e.preventDefault();
         void this.handleSend();
       } else if (e.key === "Escape" && this.busy) {
@@ -612,6 +831,7 @@ class ClaudeNotebookView extends ItemView {
         { value: "chat", icon: "message-circle", label: "Chat" },
         { value: "edit", icon: "pencil", label: "Edit" },
         { value: "quiz", icon: "graduation-cap", label: "Quiz" },
+        { value: "ask", icon: "search", label: "Ask vault" },
       ],
       this.mode,
       (v) => this.setModeUI(v as Mode),
@@ -641,6 +861,7 @@ class ClaudeNotebookView extends ItemView {
       chat: "reads your note",
       edit: "can rewrite this file",
       quiz: "asks you questions",
+      ask: "searches your whole vault",
     };
     if (this.mode === "edit") iconLabel(this.modeCaption, "pencil", captions.edit);
     else this.modeCaption.setText(captions[this.mode]);
@@ -690,6 +911,21 @@ class ClaudeNotebookView extends ItemView {
         prompt:
           "Mark my attempt against my notes ONLY. Give the model answer, a mark out of 10, and exactly where I lost marks.\n\n--- paste your attempt below this line, then send ---\n",
         send: false,
+      },
+      {
+        icon: "combine",
+        label: "Synthesise across these",
+        prompt:
+          "Read every pinned context note in full and synthesise them into ONE coherent explanation: integrate the material, reconcile any differing notation, and attach a [[wikilink]] to the origin note for each claim. If the notes conflict, surface the conflict with both sides cited.",
+        send: true,
+      },
+      {
+        icon: "search",
+        label: "Find in my notes",
+        prompt:
+          "Find where in my notes I've written about: <TOPIC — replace this>\n\nSearch the whole vault and return a ranked list, most relevant first, each as a [[wikilink]] with a one-line reason it matched.",
+        send: false,
+        mode: "ask",
       },
     ];
     // Last-used preset floats to the top of the menu.
@@ -754,7 +990,7 @@ class ClaudeNotebookView extends ItemView {
     el.style.height = Math.min(el.scrollHeight, Math.round(line * 7 + 16)) + "px";
   }
 
-  // ── interaction (engine arrives in S2) ─────────────────────────────────────
+  // ── interaction ────────────────────────────────────────────────────────────
 
   private async handleSend(): Promise<void> {
     const text = this.promptEl.value.trim();
@@ -774,10 +1010,38 @@ class ClaudeNotebookView extends ItemView {
       this.saveTimer = null;
     }
 
-    const isEdit = this.mode === "edit";
+    // Freeze the mode for this turn — a mid-turn click on the mode segment (not disabled while
+    // busy) must not make onDone tag the session with the wrong mode and skip the next re-mint.
+    const turnMode = this.mode;
+    const isEdit = turnMode === "edit";
     // A resumed session's system prompt is fixed, so a mode change can't take effect on it —
     // re-mint the session whenever the mode differs from the one it was created under.
-    if (this.sessionId && this.sessionMode !== this.mode) this.sessionId = null;
+    if (this.sessionId && this.sessionMode !== turnMode) {
+      this.sessionId = null;
+      this.contextSentPaths.clear(); // the fresh session must re-prime every pinned note
+    }
+
+    // Pinned context tray: inject the PATHS (never the bodies — bodies blow maxInjectTokens and
+    // silently truncate ~5 notes in). The agent Reads each live file with its Read tool. Prime
+    // only the paths not yet sent in THIS session; commit them in onDone only once a session
+    // truly exists (a failed/session-less turn must re-inject next time).
+    const pruned = this.contextFiles.filter(
+      (f) => this.app.vault.getAbstractFileByPath(f.path) instanceof TFile,
+    );
+    if (pruned.length !== this.contextFiles.length) {
+      // A pinned note was deleted/moved mid-session — drop it from the tray rather than injecting a dead path.
+      this.contextFiles = pruned;
+      this.renderContextChip();
+      this.persist();
+    }
+    let wireText = text;
+    const toPrime = this.contextFiles.filter((f) => !this.contextSentPaths.has(f.path));
+    if (toPrime.length) {
+      const list = toPrime.map((f) => `- "${f.path}"`).join("\n");
+      wireText =
+        `Pinned context notes — Read each of these in full (with your Read tool) before ` +
+        `answering, and ground your answer in them:\n${list}\n\n---\n\n${text}`;
+    }
 
     const notePath = this.backingFile?.path ?? SCRATCH_PATH;
     const turnPath = this.backingPath; // if the view is rebound mid-turn, don't cross the streams
@@ -794,13 +1058,21 @@ class ClaudeNotebookView extends ItemView {
     this.activeStream = stream;
     let streamed = "";
 
+    // Only a freshly-minted session gets a system prompt (a resumed session keeps its fixed
+    // one). When we mint, append the user's style guide so their conventions apply every turn.
+    // Use the FROZEN turnMode (not this.mode) — matching isEdit/readOnly/sessionMode — so a
+    // future yield point here can never mint, say, an "ask" read-only prompt for a write turn.
+    let sysPrompt = this.sessionId ? undefined : this.systemPromptFor(turnMode, notePath);
+    if (sysPrompt) sysPrompt += await this.plugin.styleGuideSuffix();
+
     this.engine.run(
-      text,
+      wireText,
       {
         cwd: this.vaultPath(),
         sessionId: this.sessionId,
-        systemPrompt: this.sessionId ? undefined : this.systemPromptFor(this.mode, notePath),
+        systemPrompt: sysPrompt,
         readOnly: !isEdit,
+        writeRoot: this.vaultPath(), // edit turns: writes are path-scoped to the vault (ignored when readOnly)
       },
       {
         onText: (delta) => {
@@ -815,13 +1087,21 @@ class ClaudeNotebookView extends ItemView {
           }
           try {
             this.sessionId = sessionId ?? this.sessionId; // never clobber a live session with null
-            if (this.sessionId) this.sessionMode = this.mode; // record what this session was minted for
+            if (this.sessionId) this.sessionMode = turnMode; // record what this session was minted for
+            // Commit the primed paths only once a session truly exists AND the turn succeeded — a
+            // failed/session-less turn must re-inject every pinned path next time, not silently
+            // drop them. Commit exactly what we injected this turn (toPrime), so a note pinned
+            // mid-turn still primes on its own next send.
+            if (!error && this.sessionId) {
+              for (const f of toPrime) this.contextSentPaths.add(f.path);
+            }
             const md = error ? `**Error:** ${error}` : finalText || streamed || "_(done)_";
             await stream.finish(md); // in place when md is what streamed; clean render otherwise
             if (!error) {
-              this.addCitationChips(finalText || streamed, notePath);
               this.recordClaude(finalText || streamed);
+              this.addCitationChips(finalText || streamed, notePath);
               if (this.isAtBottom()) this.scrollThread(); // chips landed below — keep a follower on them
+              void this.plugin.flush(); // put the reply + session id on disk now, not after the 600ms debounce
             }
             if (isEdit && !error) {
               await this.forceReload();
@@ -854,13 +1134,13 @@ class ClaudeNotebookView extends ItemView {
       this.saveTimer = null;
     }
     const content = await this.app.vault.read(this.backingFile);
+    this.lastLoadedContent = content; // Claude's write is the new baseline
     if (content !== this.editorEl.value) {
       this.editorEl.value = content;
       this.refreshEditorView();
     }
   }
 
-  /** One-click undo: restore the pre-edit snapshot of the bound note. */
   /** One pinned notice above the composer. An unused UNDO is never displaced by info notices. */
   private setNotice(kind: "undo" | "info", build: (bar: HTMLElement) => void): void {
     if (this.noticeKind === "undo" && kind === "info") return; // protect the only revert path
@@ -878,39 +1158,102 @@ class ClaudeNotebookView extends ItemView {
     }
   }
 
+  /** Record a successful Claude edit: push its pre-edit snapshot onto the bounded undo stack. */
   private addUndo(snapshot: string | null, file: TFile | null): void {
     if (snapshot === null || !file) return;
+    this.undoStack.push({ file, snapshot, label: file.basename });
+    if (this.undoStack.length > UNDO_STACK_MAX) this.undoStack.shift(); // drop the oldest
+    this.renderUndoNotice();
+  }
+
+  /** The undo notice mirrors the TOP of the stack; each Undo click walks one edit back. */
+  private renderUndoNotice(): void {
+    const top = this.undoStack[this.undoStack.length - 1];
+    if (!top) {
+      // Stack drained — release the slot so info notices can use it again.
+      this.noticeSlot.empty();
+      this.noticeKind = null;
+      return;
+    }
     this.setNotice("undo", (bar) => {
       const label = bar.createSpan({ cls: "cn-undo-label" });
-      iconLabel(label, "pencil-line", "Claude edited the note.");
+      // Name the file: the button restores THIS file — an unnamed "Claude edited the note"
+      // shown over note B would silently revert note A.
+      iconLabel(label, "pencil-line", `Claude edited “${top.label}”.`);
       const btn = bar.createEl("button", { cls: "cn-btn", text: "Undo" });
-      btn.onclick = async () => {
-        await this.app.vault.modify(file, snapshot); // restore the exact file we edited
-        if (this.backingFile?.path === file.path) await this.forceReload();
-        btn.disabled = true;
-        iconLabel(btn, "check", "Undone");
-        this.noticeKind = "info"; // consumed — the next send may clear it
+      btn.onclick = () => {
+        btn.disabled = true; // one restore per click — a double-click must not pop two entries
+        void this.undoTop();
       };
     });
   }
 
-  /** Render the [[wikilinks]] Claude cited as clickable chips below a reply. */
-  private addCitationChips(md: string, sourcePath: string): void {
-    const links = new Set<string>();
-    const re = /\[\[([^\]|#]+)(?:[#|][^\]]*)?\]\]/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(md)) !== null) links.add(m[1].trim());
-    if (links.size === 0) return;
-    const bar = this.threadBodyEl.createDiv({ cls: "cn-chips" });
-    links.forEach((link) => {
-      const chip = bar.createEl("button", { cls: "cn-btn cn-cite" });
-      iconLabel(chip, "link", link);
-      chip.onclick = () => void this.app.workspace.openLinkText(link, sourcePath, true);
-    });
-    this.scrollThread();
+  /** Restore the top entry's file to its pre-edit snapshot, pop it, then surface the next one. */
+  private async undoTop(): Promise<void> {
+    const top = this.undoStack[this.undoStack.length - 1];
+    if (!top) return;
+    // Kill any pending debounced save first, or it can fire after the restore and
+    // re-clobber the file with the post-edit buffer (silently negating the undo).
+    if (this.saveTimer) {
+      window.clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    await this.app.vault.modify(top.file, top.snapshot); // restore the exact file we edited
+    if (this.backingFile?.path === top.file.path) await this.forceReload();
+    this.undoStack.pop();
+    this.renderUndoNotice(); // the next entry down, or clear the slot when the stack is empty
   }
 
-  // ── save as study note (S5) ────────────────────────────────────────────────
+  /** Render the [[wikilinks]] Claude cited as clickable chips below a reply. */
+  private addCitationChips(md: string, sourcePath: string): void {
+    // Capture the FULL link target incl. any #heading / #^block anchor; drop a |alias.
+    // Dedupe by the target string so A#H1 and A#H2 stay distinct chips but exact repeats collapse.
+    const targets = new Set<string>();
+    const re = /\[\[([^\]]+?)\]\]/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(md)) !== null) {
+      const target = m[1].split("|")[0].trim(); // Note, Note#Heading, or Note#^block
+      if (target) targets.add(target);
+    }
+    if (targets.size === 0) return;
+    // Measure before appending: chips almost always exist (the prompts demand citations), so an
+    // unconditional scroll here would yank a reader who scrolled up on every completed turn.
+    const stick = this.isAtBottom();
+    const bar = this.threadBodyEl.createDiv({ cls: "cn-chips" });
+    targets.forEach((target) => {
+      const hashAt = target.indexOf("#");
+      const basename = (hashAt === -1 ? target : target.slice(0, hashAt)).trim();
+      const anchor = hashAt === -1 ? "" : target.slice(hashAt + 1).replace(/^\^/, "").trim();
+      // internal-link + data-href/href wire the chip into core Page Preview; the chip classes keep its look.
+      const chip = bar.createEl("button", {
+        cls: "cn-btn cn-cite internal-link",
+        attr: { "data-href": target, href: target },
+      });
+      const ic = chip.createSpan({ cls: "cn-ic" });
+      setIcon(ic, "link");
+      const label = chip.createSpan({ cls: "cn-cite-label" });
+      label.setText(basename);
+      if (anchor) {
+        label.createSpan({ cls: "cn-cite-sep", text: " › " });
+        label.appendText(anchor);
+      }
+      chip.addEventListener("mouseover", (e) => {
+        // Core Page Preview shows the section popover; a no-op if that core plugin is off.
+        this.app.workspace.trigger("hover-link", {
+          event: e,
+          source: "claude-notebook",
+          hoverParent: this,
+          targetEl: chip,
+          linktext: target,
+          sourcePath,
+        } as unknown as Parameters<typeof this.app.workspace.trigger>[1]);
+      });
+      chip.onclick = () => void this.app.workspace.openLinkText(target, sourcePath, true);
+    });
+    if (stick) this.scrollThread();
+  }
+
+  // ── save as study note ─────────────────────────────────────────────────────
 
   private openSaveModal(): void {
     if (this.busy) {
@@ -923,7 +1266,7 @@ class ClaudeNotebookView extends ItemView {
         .replace(/\s*\(working copy\)\s*$/i, "")
         .replace(/^Lecture\s+\d+\s*[-—]\s*/i, "")
         .trim() || base;
-    new SaveStudyNoteModal(this.app, defaultTopic, (type, topic) =>
+    new StudyNoteSaveModal(this.app, defaultTopic, (type, topic) =>
       void this.saveAsStudyNote(type, topic),
     ).open();
   }
@@ -932,14 +1275,20 @@ class ClaudeNotebookView extends ItemView {
     const wc = this.backingFile;
     if (!wc) return;
 
-    // sanitise the free-text topic so it can never escape Study/<Subject>/
+    // sanitise the free-text topic so it can never escape Study/<Subject>/ and can't produce a
+    // Windows-invalid filename (a topic like "Week 3: CAPM" would otherwise be uncreatable).
     const safeTopic =
-      topic.replace(/[\\/]/g, "-").replace(/\.{2,}/g, "").replace(/^\.+/, "").trim() || "Notes";
+      topic.replace(/[\\/:*?"<>|]/g, "-").replace(/\.{2,}/g, "").replace(/^\.+/, "").trim() || "Notes";
     const m = wc.path.match(/^Study\/([^/]+)\//);
     const subjectName = m ? m[1] : "Cross-Subject";
     const meta = SUBJECT_MAP[subjectName] ?? { code: "", tag: "" };
     const token = TYPE_TOKEN[type];
-    const targetPath = `Study/${subjectName}/${safeTopic} — ${token}.md`;
+    // Don't clobber an existing note (with possible manual edits) at the same Type+Topic —
+    // uniquify with a numeric suffix. There is no undo for save-as, so overwrite must be opt-in.
+    let targetPath = `Study/${subjectName}/${safeTopic} — ${token}.md`;
+    for (let n = 2; this.app.vault.getAbstractFileByPath(targetPath); n++) {
+      targetPath = `Study/${subjectName}/${safeTopic} — ${token} (${n}).md`;
+    }
     const today = localDate();
     const topicTag = safeTopic
       .toLowerCase()
@@ -973,7 +1322,9 @@ class ClaudeNotebookView extends ItemView {
       `tags: [study, study/${type}, ${meta.tag}, ${topicTag}]\n` +
       `cssclasses: [study-note]\n` +
       `---\n\n` +
-      `Rules: cite every claim/formula inline as a [[wikilink]] to the source note; end with a ` +
+      `Rules: cite every claim/formula inline as a [[wikilink]] to the source note, anchored to the ` +
+      `specific section with [[Note#Heading]] (or a block ref [[Note#^blockid]]) when one fits, else a ` +
+      `bare [[Note]]; end with a ` +
       `"## Sources" section listing those wikilinks; use ONLY the user's notes and flag anything ` +
       `outside them with a "> [!warning]" callout. NEVER edit the working copy or any file under ` +
       `"Subjects/" — only CREATE the new file at "${targetPath}". When done, reply with one short ` +
@@ -981,7 +1332,7 @@ class ClaudeNotebookView extends ItemView {
 
     this.engine.run(
       prompt,
-      { cwd: this.vaultPath(), sessionId: null, systemPrompt: undefined, readOnly: false },
+      { cwd: this.vaultPath(), sessionId: null, systemPrompt: undefined, readOnly: false, writeRoot: this.vaultPath() },
       {
         onText: (d) => {
           streamed += d;
@@ -1068,7 +1419,15 @@ class ClaudeNotebookView extends ItemView {
   }
 
   private async transcribeImage(imgPath: string, imgName: string): Promise<void> {
+    // handlePaste's busy check went stale across its awaits (arrayBuffer/createBinary); a send
+    // in that gap would start a second run on the one engine and orphan the first. Re-check here.
+    if (this.busy) {
+      new Notice("Wait for the current turn to finish.");
+      return;
+    }
     this.setBusy(true);
+    const turnPath = this.backingPath; // don't append the transcription into a note we rebound to
+    const turnFile = this.backingFile;
     this.addMessage("you", "Transcribe pasted image");
     const streamEl = this.startAssistantStream();
     const stream = new StreamRenderer(
@@ -1101,7 +1460,7 @@ class ClaudeNotebookView extends ItemView {
           stream.push(d);
         },
         onDone: async ({ text: finalText, error }) => {
-          if (this.turnCancelled) {
+          if (this.turnCancelled || this.backingPath !== turnPath) {
             stream.cancel();
             this.setBusy(false);
             return;
@@ -1111,12 +1470,25 @@ class ClaudeNotebookView extends ItemView {
               await stream.finish(`**Error:** ${error}`);
             } else {
               const transcription = (finalText || streamed).trim();
-              const cur = this.editorEl.value;
-              const sep = cur.endsWith("\n") ? "" : "\n";
-              this.editorEl.value =
-                cur + `${sep}\n---\n*Transcribed image:* ![[${imgName}]]\n\n${transcription}\n`;
-              await this.saveNow();
-              this.refreshEditorView();
+              // Write straight to the captured file (not editorEl, which the guard above proved
+              // is still turnPath) so a race can never land the transcription in another note.
+              const target = turnFile ?? this.backingFile;
+              if (target) {
+                const cur = await this.app.vault.read(target);
+                const sep = cur.endsWith("\n") ? "" : "\n";
+                const next = cur + `${sep}\n---\n*Transcribed image:* ![[${imgName}]]\n\n${transcription}\n`;
+                this.writing = true;
+                try {
+                  await this.app.vault.modify(target, next);
+                } finally {
+                  this.writing = false;
+                }
+                if (this.backingFile?.path === target.path) {
+                  this.editorEl.value = next;
+                  this.lastLoadedContent = next; // keep the save-conflict baseline in sync (no spurious sidecar)
+                  this.refreshEditorView();
+                }
+              }
               await stream.finish("Transcribed the image into the note.");
               this.recordClaude("Transcribed the image into the note.");
             }
@@ -1147,7 +1519,10 @@ class ClaudeNotebookView extends ItemView {
   private setBusy(b: boolean): void {
     this.busy = b;
     if (b) this.turnCancelled = false;
-    this.promptEl.disabled = b;
+    // readOnly, not disabled: a disabled textarea is blurred and swallows keydown, so the
+    // Esc-to-cancel handler (the busy placeholder advertises it) could never fire. handleSend
+    // already guards on busy, so readOnly is enough to block sends while keeping Esc alive.
+    this.promptEl.readOnly = b;
     if (this.composerEl) this.composerEl.setAttr("data-busy", b ? "true" : "false");
     // In edit mode Claude rewrites the bound note — lock the textarea so mid-turn typing isn't lost.
     const editTurn = b && this.mode === "edit";
@@ -1193,7 +1568,10 @@ class ClaudeNotebookView extends ItemView {
     }
     const citeRule =
       `Cite the ORIGINAL source note as a [[wikilink]] — e.g. the lecture/tutorial a working ` +
-      `copy is derived from (named in its header), NOT the working-copy file itself.`;
+      `copy is derived from (named in its header), NOT the working-copy file itself. ` +
+      `Anchor each citation to the specific section the claim comes from with ` +
+      `[[Note#Heading]] (or a block ref [[Note#^blockid]]), falling back to a bare [[Note]] only ` +
+      `when no finer anchor fits.`;
     if (mode === "quiz") {
       return (
         `You are a Socratic quizmaster inside the user's Obsidian study vault. ` +
@@ -1201,6 +1579,16 @@ class ClaudeNotebookView extends ItemView {
         `Read tool. Ask ONE question at a time and wait for their answer; when they reply, ` +
         `say whether they're right, briefly explain, then ask the next question. ${citeRule} ` +
         `Keep everything grounded in THEIR notes. Do not modify any files.`
+      );
+    }
+    if (mode === "ask") {
+      return (
+        `You are searching the user's ENTIRE Obsidian vault to answer their question. ` +
+        `Use your Grep/Glob/Read tools to find the relevant notes ACROSS THE WHOLE VAULT ` +
+        `(not just one note). Answer concisely, and cite every note you actually consulted as a ` +
+        `[[wikilink]], anchored to the specific section with [[Note#Heading]] (or a block ref ` +
+        `[[Note#^blockid]]) when one fits, so the user can open it. If the vault has nothing on the topic, say so ` +
+        `plainly and name the closest thing you did find. Do NOT modify any files.`
       );
     }
     return (
@@ -1249,6 +1637,7 @@ class ClaudeNotebookView extends ItemView {
     this.plugin.setConvo(this.backingPath, {
       sessionId: this.sessionId,
       messages: this.messages,
+      contextPaths: this.contextFiles.map((f) => f.path),
     });
   }
 
@@ -1278,7 +1667,16 @@ class ClaudeNotebookView extends ItemView {
       window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    if (this.backingFile) await this.saveNow();
+    // Guard the outgoing save: if it throws (OneDrive-locked file), the switch must still
+    // proceed — otherwise backingPath (already reassigned by the caller) and the in-memory
+    // thread diverge, and the next persist() writes the OLD thread under the NEW note's key.
+    if (this.backingFile) {
+      try {
+        await this.saveNow();
+      } catch (e) {
+        new Notice(`Couldn't save the previous note before switching: ${String(e)}`);
+      }
+    }
 
     const { vault } = this.app;
     try {
@@ -1297,18 +1695,34 @@ class ClaudeNotebookView extends ItemView {
         }
       }
       this.backingFile = file as TFile;
-      this.editorEl.value = await vault.read(this.backingFile);
+      this.lastLoadedContent = await vault.read(this.backingFile);
+      this.editorEl.value = this.lastLoadedContent;
     } catch (e) {
       new Notice(`Claude Notebook couldn't open its note: ${String(e)}`);
       this.editorEl.value = "";
+      this.lastLoadedContent = null;
       this.backingFile = null;
     }
     this.refreshEditorView();
+    // The undo/info notice belonged to the note we just left; clear it so its Undo can't
+    // silently revert a now-off-screen file (the button restores the file it captured).
+    // The stacked snapshots underneath it belong to that old workbench too — drop them all.
+    this.noticeSlot.empty();
+    this.noticeKind = null;
+    this.undoStack.length = 0;
     // restore this note's saved conversation (thread + session)
     const convo = this.plugin.getConvo(this.backingPath);
     this.messages = convo?.messages ? convo.messages.slice() : [];
     this.sessionId = convo?.sessionId ?? null;
     this.sessionMode = null; // a freshly loaded session re-mints its system prompt on first turn
+    // Restore this note's pinned context tray: resolve each saved path, keep the survivors as
+    // TFiles in order. A fresh session on load means nothing is primed yet.
+    this.contextFiles = (convo?.contextPaths ?? [])
+      .map((p) => this.app.vault.getAbstractFileByPath(p))
+      .filter((f): f is TFile => f instanceof TFile);
+    this.contextSentPaths.clear();
+    this.dismissedHintPath = null;
+    this.renderContextChip();
     this.renderThread();
   }
 
@@ -1320,6 +1734,7 @@ class ClaudeNotebookView extends ItemView {
     if (content !== this.editorEl.value) {
       const top = this.editorEl.scrollTop;
       this.editorEl.value = content;
+      this.lastLoadedContent = content;
       this.editorEl.scrollTop = top;
       this.refreshEditorView();
     }
@@ -1332,9 +1747,37 @@ class ClaudeNotebookView extends ItemView {
 
   private async saveNow(): Promise<void> {
     if (!this.backingFile) return;
+    // Conflict guard: while the editor was focused, a modify event (OneDrive sync from another
+    // device, or an edit in a normal tab) is skipped by reloadIfUnfocused and never reconciled.
+    // Blindly writing the buffer would erase that external change.
+    const buffer = this.editorEl.value;
+    // No local edits since the last load/save → skip the write, so an unreconciled external change
+    // on disk survives untouched (it gets pulled into the editor on the next blur/reload).
+    if (this.lastLoadedContent !== null && buffer === this.lastLoadedContent) return;
+    try {
+      const disk = await this.app.vault.read(this.backingFile);
+      // Both the buffer AND the disk diverged from what we loaded → a genuine conflict. Preserve
+      // the external version in a sidecar (uniquified, so a second conflict isn't silently lost)
+      // before saving ours.
+      if (this.lastLoadedContent !== null && disk !== this.lastLoadedContent && disk !== buffer) {
+        let bak = `${this.backingFile.path.replace(/\.md$/, "")} (conflict ${localDate()}).md`;
+        for (let n = 2; this.app.vault.getAbstractFileByPath(bak); n++) {
+          bak = `${this.backingFile.path.replace(/\.md$/, "")} (conflict ${localDate()} ${n}).md`;
+        }
+        try {
+          await this.app.vault.create(bak, disk);
+          new Notice(`This note changed on disk while you were editing — the other version was saved to “${bak.split("/").pop()}”.`);
+        } catch {
+          /* if the backup itself fails, still don't lose the user's current buffer below */
+        }
+      }
+    } catch {
+      /* read failed — fall through and attempt the write as before */
+    }
     this.writing = true;
     try {
-      await this.app.vault.modify(this.backingFile, this.editorEl.value);
+      await this.app.vault.modify(this.backingFile, buffer);
+      this.lastLoadedContent = buffer;
     } finally {
       this.writing = false;
     }
@@ -1342,7 +1785,7 @@ class ClaudeNotebookView extends ItemView {
 }
 
 /** Modal: pick a Type + Topic, then Claude writes the cited study note. */
-class SaveStudyNoteModal extends Modal {
+class StudyNoteSaveModal extends Modal {
   private type: StudyType = "summary";
 
   constructor(
@@ -1410,19 +1853,11 @@ class ClaudeNotebookSettingTab extends PluginSettingTab {
         }),
       );
 
+    // Only settings that actually drive behaviour are shown. The interactive turns run on the
+    // CLI's own model; the former "Analysis model / Routine model / Budget guard" rows were never
+    // read by any turn and were removed rather than left as controls that do nothing.
     new Setting(containerEl).setName("Models").setHeading();
-    text("Analysis model", "Reasoning ceiling for hard analysis.", "model");
-    text("Routine model", "Everyday workhorse for most turns.", "routineModel");
-    text("Sub-agent model", "Cheap tier for classify / route / distill.", "subAgentModel");
-    new Setting(containerEl)
-      .setName("Budget guard")
-      .setDesc("Restrict the analysis model to heavy tasks so routine turns don't use up your usage limits.")
-      .addToggle((t) =>
-        t.setValue(s.opusBudgetGuard).onChange(async (v) => {
-          s.opusBudgetGuard = v;
-          await this.plugin.saveSettings();
-        }),
-      );
+    text("Sub-agent model", "Model for the background enrich pass (classify / route / distill).", "subAgentModel");
     new Setting(containerEl)
       .setName("Max inject tokens")
       .setDesc("Distill content above this size before injecting it into a turn.")
@@ -1444,7 +1879,25 @@ class ClaudeNotebookSettingTab extends PluginSettingTab {
     text("Downloads folder", "Filesystem folder the organizer watches.", "downloadsPath");
     text("Dropped Notes folder", "Vault-relative folder for persisted drops.", "droppedNotesPath");
     text("Sorted wrapper", "Wrapper folder name inside Downloads.", "sortedWrapper");
-    text("Routing-guide note", "Vault-relative path to the intent->folder map.", "routingGuidePath");
+
+    new Setting(containerEl).setName("Voice & filing").setHeading();
+    text(
+      "Style-guide note",
+      "A note whose content is added to Claude's instructions each session (your preferred voice, formatting, conventions). Leave blank to disable.",
+      "styleGuideNotePath",
+    );
+    new Setting(containerEl)
+      .setName("Routing-guide note")
+      .setDesc(
+        "Optional. A note with custom filing rules, one per line: `keyword1, keyword2: folder-name`. Consulted before the built-in categories. Leave blank to use defaults only.",
+      )
+      .addText((t) =>
+        t.setValue(s.routingGuidePath).onChange(async (v) => {
+          s.routingGuidePath = v;
+          await this.plugin.saveSettings();
+          await this.plugin.refreshUserCategoryRules();
+        }),
+      );
 
     new Setting(containerEl)
       .setName("Drop anywhere")
@@ -1452,6 +1905,16 @@ class ClaudeNotebookSettingTab extends PluginSettingTab {
       .addToggle((t) =>
         t.setValue(this.plugin.cfg.globalDropIngest).onChange(async (v) => {
           this.plugin.cfg.globalDropIngest = v;
+          await this.plugin.saveSettings();
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Follow the active note")
+      .setDesc("When ON, the Notebook automatically rebinds to whatever note you focus (swapping to that note's own chat). OFF (default): the workbench stays put, and a slim nudge lets you attach the note you're viewing to the current chat.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.cfg.followActiveNote).onChange(async (v) => {
+          this.plugin.cfg.followActiveNote = v;
           await this.plugin.saveSettings();
         }),
       );
@@ -1492,7 +1955,7 @@ class ClaudeNotebookSettingTab extends PluginSettingTab {
       .setDesc("When the optional cleanup pass runs on filed notes. The drop itself never calls the model.")
       .addDropdown((d) =>
         d
-          .addOptions({ nightly: "nightly (default — batched sweep)", immediate: "immediate", off: "off" })
+          .addOptions({ nightly: "nightly (default — batched sweep)", off: "off" })
           .setValue(this.plugin.cfg.enrichMode)
           .onChange(async (v) => {
             this.plugin.cfg.enrichMode = v as CnSettings["enrichMode"];
@@ -1505,6 +1968,10 @@ class ClaudeNotebookSettingTab extends PluginSettingTab {
 export default class ClaudeNotebookPlugin extends Plugin {
   private cnData: CnData = { conversations: {}, settings: { ...DEFAULT_SETTINGS } };
   private persistTimer: number | null = null;
+  /** Debounced Desk-canvas re-link handle; cleared on unload so it can't write after teardown. */
+  private linkDebounce: number | null = null;
+  /** Re-entrancy lock: a nightly run slower than the 30-min interval must not overlap itself. */
+  private nightlyRunning = false;
   /** Last non-Notebook leaf the user focused — the target for "Send this tab to Claude". */
   private lastReadableLeaf: WorkspaceLeaf | null = null;
 
@@ -1517,6 +1984,39 @@ export default class ClaudeNotebookPlugin extends Plugin {
   /** Persist immediately (the conversation cache uses a debounced path at saveData). */
   async saveSettings(): Promise<void> {
     await this.saveData(this.cnData);
+  }
+
+  /** The user's style-guide note, ready to append to a freshly-minted system prompt (Feature 5).
+   *  "" when unset, missing, or on any read error — so it never breaks a turn. Clamped to ~2000
+   *  chars. The note is the user's own trusted content, so appending it to instructions is intended. */
+  async styleGuideSuffix(): Promise<string> {
+    try {
+      const p = this.cfg.styleGuideNotePath;
+      if (!p) return "";
+      const f = this.app.vault.getAbstractFileByPath(p);
+      if (!(f instanceof TFile)) return "";
+      const body = (await this.app.vault.cachedRead(f)).slice(0, 2000);
+      return `\n\nThe user's style guide — follow it:\n${body}`;
+    } catch {
+      return "";
+    }
+  }
+
+  /** Load (or clear) the custom ingest-classification rules from the routing-guide note (Feature 5).
+   *  Called on settings load and whenever the routing-guide setting changes. When the note is unset
+   *  or missing, the rules are cleared, so classification falls back to the built-in categories. */
+  async refreshUserCategoryRules(): Promise<void> {
+    try {
+      const p = this.cfg.routingGuidePath;
+      const f = p ? this.app.vault.getAbstractFileByPath(p) : null;
+      if (f instanceof TFile) {
+        setUserCategoryRules(await this.app.vault.cachedRead(f));
+      } else {
+        setUserCategoryRules("");
+      }
+    } catch {
+      setUserCategoryRules("");
+    }
   }
 
   /** Flush the debounced conversation save now — called on view close and plugin unload
@@ -1534,6 +2034,10 @@ export default class ClaudeNotebookPlugin extends Plugin {
     // don't linger orphaned, calling into a torn-down instance after disable/update.
     document.querySelectorAll(".cn-desk-toolbar").forEach((el) => el.remove());
     document.querySelectorAll(".cn-desk-canvas").forEach((el) => el.classList.remove("cn-desk-canvas"));
+    if (this.linkDebounce) {
+      window.clearTimeout(this.linkDebounce);
+      this.linkDebounce = null;
+    }
     void this.flush(); // best-effort final save of any pending conversation
   }
 
@@ -1552,11 +2056,40 @@ export default class ClaudeNotebookPlugin extends Plugin {
         if (fs.existsSync(probe)) this.cnData.settings!.convertPyPath = probe;
       }
     }
+    // Prime the custom ingest-classification rules from the routing-guide note (Feature 5).
+    void this.refreshUserCategoryRules();
     this.addSettingTab(new ClaudeNotebookSettingTab(this.app, this));
 
     this.registerView(
       VIEW_TYPE_CLAUDE_NOTEBOOK,
       (leaf) => new ClaudeNotebookView(leaf, this),
+    );
+
+    // Keep the per-note conversation store keyed to the live path. Without this, renaming a
+    // bound note orphans its whole thread (getConvo(newPath) is empty), and its live-sync
+    // listener stops matching; deleting a note leaks its thread into data.json forever.
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        if (!(file instanceof TFile)) return;
+        const convo = this.cnData.conversations[oldPath];
+        if (convo) {
+          this.cnData.conversations[file.path] = convo;
+          delete this.cnData.conversations[oldPath];
+          this.scheduleConvoSave();
+        }
+        for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_CLAUDE_NOTEBOOK)) {
+          const v = leaf.view;
+          if (v instanceof ClaudeNotebookView) v.onBackingRenamed(oldPath, file.path);
+        }
+      }),
+    );
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        if (this.cnData.conversations[file.path]) {
+          delete this.cnData.conversations[file.path];
+          this.scheduleConvoSave();
+        }
+      }),
     );
 
     this.addRibbonIcon("bot", "Summon Claude Notebook", () => {
@@ -1586,7 +2119,7 @@ export default class ClaudeNotebookPlugin extends Plugin {
       callback: () => void this.addSelectionToNotebook(),
     });
 
-    // Component B: send whatever tab you're looking at to Claude as context.
+    // Send-tab: send whatever tab you're looking at to Claude as context.
     this.addCommand({
       id: "send-tab-to-claude",
       name: "Send this tab to Claude",
@@ -1618,7 +2151,14 @@ export default class ClaudeNotebookPlugin extends Plugin {
       callback: () => void this.teachThisTab(),
     });
 
-    // File facility: linter, reclassify, deferred enrich.
+    // Spaced-review dispatch: closes the Teach-Me loop by resurfacing what's due.
+    this.addCommand({
+      id: "show-due-reviews",
+      name: "Show due reviews",
+      callback: () => void this.reviewDispatch(false),
+    });
+
+    // The file facility: linter, reclassify, deferred enrich.
     this.addCommand({
       id: "facility-validate",
       name: "Facility: Validate frontmatter (report → _index/Malformed.md)",
@@ -1741,13 +2281,14 @@ export default class ClaudeNotebookPlugin extends Plugin {
       callback: () => void this.deskTogglePin(),
     });
     // Native sidebar drags land on the Desk without going through addFileToDesk —
-    // auto-wire their wikilink edges shortly after the canvas file changes.
-    let linkDebounce: number | null = null;
+    // auto-wire their wikilink edges shortly after the canvas file changes. The handle is an
+    // instance field so onunload can clear it (a pending 1.5s timer must not write the canvas
+    // from a torn-down instance).
     this.registerEvent(
       this.app.vault.on("modify", (f) => {
         if (f.path !== this.deskPath) return;
-        if (linkDebounce) window.clearTimeout(linkDebounce);
-        linkDebounce = window.setTimeout(() => void this.deskLinkRelated(true), 1500);
+        if (this.linkDebounce) window.clearTimeout(this.linkDebounce);
+        this.linkDebounce = window.setTimeout(() => void this.deskLinkRelated(true), 1500);
       }),
     );
 
@@ -1808,8 +2349,10 @@ export default class ClaudeNotebookPlugin extends Plugin {
       },
       true,
     );
-    // Preset toolbar appears whenever the Desk canvas is focused.
+    // Preset toolbar appears whenever the Desk canvas is focused; file-open catches the same
+    // leaf navigating to a different canvas (so a stale toolbar gets stripped, not left floating).
     this.registerEvent(this.app.workspace.on("active-leaf-change", (leaf) => this.maybeInjectDeskToolbar(leaf)));
+    this.registerEvent(this.app.workspace.on("file-open", () => this.maybeInjectDeskToolbar(this.app.workspace.getMostRecentLeaf())));
     // Right-click any file anywhere → add to the Desk (max seamlessness).
     this.registerEvent(
       this.app.workspace.on("file-menu", (menu, file) => {
@@ -1827,8 +2370,10 @@ export default class ClaudeNotebookPlugin extends Plugin {
 
     // Nightly maintenance, catch-up style: once per day, at the first
     // moment Obsidian is open after 03:00 — laptops sleep through literal 3am crons.
+    // Both timers go through registerInterval so Obsidian clears them on unload — the 90s
+    // kickoff must not run maintenance (sweep/enrich/file writes) on a torn-down instance.
     this.registerInterval(window.setInterval(() => void this.nightlyTick(), 30 * 60 * 1000));
-    window.setTimeout(() => void this.nightlyTick(), 90 * 1000);
+    this.registerInterval(window.setTimeout(() => void this.nightlyTick(), 90 * 1000));
   }
 
   private get deskPath(): string {
@@ -2581,8 +3126,16 @@ export default class ClaudeNotebookPlugin extends Plugin {
     if (!leaf) return;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const v = leaf.view as any;
-    if (v?.getViewType?.() !== "canvas" || v.file?.path !== this.deskPath) return;
+    if (v?.getViewType?.() !== "canvas") return;
     const host = v.containerEl as HTMLElement;
+    if (v.file?.path !== this.deskPath) {
+      // This canvas leaf is now showing a DIFFERENT canvas (Obsidian reuses the view). Strip our
+      // injected toolbar + scoping class, or its buttons would silently rewrite the Study Desk
+      // file and the 100%-sizing CSS would apply to an unrelated canvas.
+      host.querySelector(".cn-desk-toolbar")?.remove();
+      host.removeClass("cn-desk-canvas");
+      return;
+    }
     host.addClass("cn-desk-canvas"); // scopes the desk-only card CSS to this one canvas
     if (host.querySelector(".cn-desk-toolbar")) return;
     const bar = host.createDiv({ cls: "cn-desk-toolbar" });
@@ -2613,9 +3166,16 @@ export default class ClaudeNotebookPlugin extends Plugin {
   }
 
   private async clearDesk(): Promise<void> {
-    const empty = JSON.stringify({ nodes: [], edges: [] }, null, 1);
-    if (await this.app.vault.adapter.exists(this.deskPath)) await this.app.vault.adapter.write(this.deskPath, empty);
-    else await this.app.vault.create(this.deskPath, empty);
+    // Route through the open canvas when present — a raw disk write is stomped by the canvas's
+    // own debounced save (its next requestSave rewrites the old nodes), so "cleared" would lie.
+    const c = this.deskCanvas();
+    if (c) {
+      await this.deskApplyData(c, { nodes: [], edges: [] });
+    } else if (await this.app.vault.adapter.exists(this.deskPath)) {
+      await this.app.vault.adapter.write(this.deskPath, JSON.stringify({ nodes: [], edges: [] }, null, 1));
+    } else {
+      await this.app.vault.create(this.deskPath, JSON.stringify({ nodes: [], edges: [] }, null, 1));
+    }
     new Notice("Study Desk cleared.");
   }
 
@@ -2674,12 +3234,30 @@ export default class ClaudeNotebookPlugin extends Plugin {
     const p = (n: number) => String(n).padStart(2, "0");
     const localDay = `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}`;
     if (this.cfg.lastNightlyRun === localDay) return;
-    this.cfg.lastNightlyRun = localDay;
-    await this.saveSettings();
-    if (this.cfg.sweepMove) await this.sweepDownloads(true);
-    if (this.cfg.enrichMode === "nightly") await this.enrichInbox(true);
-    await this.healthReport(true);
-    await this.generateFileCanvas(true);
+    // Re-entrancy lock: a run slower than the 30-min interval (enrich spawns up to 20 sequential
+    // CLI calls) would otherwise start a second concurrent run of the same day. lastNightlyRun is
+    // now set only AFTER the tasks (so a crash mid-run retries), so the lock is what prevents overlap.
+    if (this.nightlyRunning) return;
+    this.nightlyRunning = true;
+    try {
+      // Isolate each task so one failure (e.g. enrich's renameFile) doesn't skip the rest.
+      const run = async (label: string, fn: () => Promise<void>) => {
+        try {
+          await fn();
+        } catch (e) {
+          console.error(`Claude Notebook nightly ${label} failed:`, e);
+        }
+      };
+      if (this.cfg.sweepMove) await run("sweep", () => this.sweepDownloads(true));
+      if (this.cfg.enrichMode === "nightly") await run("enrich", () => this.enrichInbox(true));
+      await run("health", () => this.healthReport(true));
+      await run("canvas", () => this.generateFileCanvas(true));
+      await run("reviews", () => this.reviewDispatch(true));
+      this.cfg.lastNightlyRun = localDay;
+      await this.saveSettings();
+    } finally {
+      this.nightlyRunning = false;
+    }
   }
 
   /**
@@ -2759,7 +3337,7 @@ export default class ClaudeNotebookPlugin extends Plugin {
   }
 
   /**
-   * M4 sweep: empty Downloads into the store. Loose settled files only (organizer's
+   * Nightly sweep: empty Downloads into the store. Loose settled files only (organizer's
    * partial/settle guards apply): documents/images/code are ingested then removed from
    * Downloads; installers/archives are quarantined into <Downloads>/_Sorted, never
    * vault-ingested (they'd bloat _files). Subfolders are atomic — left alone, reported.
@@ -2780,17 +3358,32 @@ export default class ClaudeNotebookPlugin extends Plugin {
     let quarantined = 0;
     let failed = 0;
     for (const it of loose) {
+      // Only ingest what the docstring promises — documents/images/code. Installers/archives are
+      // quarantined; 'other' (videos, disk images, 5 GB screen recordings) is neither ingested
+      // into the OneDrive-synced vault nor deleted — it's reported and left in place.
       if (it.bucket === "installer" || it.bucket === "archive") {
         try {
           const qdir = path.join(root, this.cfg.sortedWrapper);
           fs.mkdirSync(qdir, { recursive: true });
-          fs.renameSync(it.pathAbs, path.join(qdir, it.name));
+          // Don't let MoveFileEx silently replace an earlier same-named quarantined file.
+          let dest = path.join(qdir, it.name);
+          if (fs.existsSync(dest)) {
+            const dot = it.name.lastIndexOf(".");
+            const stem = dot > 0 ? it.name.slice(0, dot) : it.name;
+            const extn = dot > 0 ? it.name.slice(dot) : "";
+            for (let n = 2; fs.existsSync(dest); n++) dest = path.join(qdir, `${stem} (${n})${extn}`);
+          }
+          fs.renameSync(it.pathAbs, dest);
           quarantined++;
           lines.push(`- 📦 \`${it.name}\` → quarantined in \`${this.cfg.sortedWrapper}/\``);
         } catch (e) {
           failed++;
           lines.push(`- ⚠ \`${it.name}\` quarantine failed: ${String(e).slice(0, 120)}`);
         }
+        continue;
+      }
+      if (it.bucket === "other") {
+        lines.push(`- ⏭ \`${it.name}\` — left in place (not a document/image/code file)`);
         continue;
       }
       const r = await ingestFile(this.app, cfg, it.pathAbs);
@@ -2823,7 +3416,7 @@ export default class ClaudeNotebookPlugin extends Plugin {
   }
 
   /**
-   * S-metric health report: counts only into the TRACKED _index/Health.md;
+   * Health report: counts only into the TRACKED _index/Health.md;
    * anything naming personal files (orphan note titles) goes to the gitignored store root.
    */
   private async healthReport(quiet: boolean): Promise<void> {
@@ -2869,7 +3462,7 @@ export default class ClaudeNotebookPlugin extends Plugin {
     const health = [
       "# 🩺 Facility health",
       "",
-      `Updated ${new Date().toISOString().slice(0, 10)} (auto, nightly).`,
+      `Updated ${localDate()} (auto, nightly).`,
       "",
       `| Metric | Value |`,
       `|---|---|`,
@@ -2968,7 +3561,7 @@ export default class ClaudeNotebookPlugin extends Plugin {
     }
   }
 
-  /** M1 linter: check every Dropped Note against the schema; report, never edit. */
+  /** Frontmatter linter: check every Dropped Note against the schema; report, never edit. */
   private async validateFacility(): Promise<void> {
     const root = this.cfg.droppedNotesPath + "/";
     const required = ["title", "type", "category", "hash", "source", "ingested", "status", "schema_version"];
@@ -2991,7 +3584,7 @@ export default class ClaudeNotebookPlugin extends Plugin {
     const report = [
       "# Malformed notes (frontmatter linter)",
       "",
-      `Checked **${checked}** notes on ${new Date().toISOString().slice(0, 10)} — **${rows.length}** violations. Old pre-schema notes are expected here until the M7 backfill.`,
+      `Checked **${checked}** notes on ${localDate()} — **${rows.length}** violations. Old pre-schema notes are expected here until the backfill.`,
       "",
       ...(rows.length ? rows : ["_(all clean)_"]),
       "",
@@ -3002,7 +3595,7 @@ export default class ClaudeNotebookPlugin extends Plugin {
     new Notice(`Linter: ${rows.length} violations in ${checked} notes → ${p}`);
   }
 
-  /** M2 Reclassify: pick a category → rewrite frontmatter, move into its folder, keep an audit. */
+  /** Reclassify: pick a category → rewrite frontmatter, move into its folder, keep an audit. */
   private reclassifyCurrent(): void {
     const file = this.app.workspace.getActiveFile();
     if (!file || !file.path.startsWith(this.cfg.droppedNotesPath + "/")) {
@@ -3025,20 +3618,28 @@ export default class ClaudeNotebookPlugin extends Plugin {
       fm.confidence = 1;
       if (fm.status === "inbox") fm.status = "active";
       const audit = Array.isArray(fm.reclassified) ? fm.reclassified : [];
-      audit.push(`${from}→${cat.slug} on ${new Date().toISOString().slice(0, 10)}`);
+      audit.push(`${from}→${cat.slug} on ${localDate()}`);
       fm.reclassified = audit;
     });
     const dest = `${this.cfg.droppedNotesPath}/${cat.folder}/${file.name}`;
     if (dest !== file.path) {
       const folder = `${this.cfg.droppedNotesPath}/${cat.folder}`;
       if (!(await this.app.vault.adapter.exists(folder))) await this.app.vault.createFolder(folder);
-      await this.app.fileManager.renameFile(file, dest);
+      try {
+        await this.app.fileManager.renameFile(file, dest);
+      } catch (e) {
+        // A same-named note already lives in the target folder — frontmatter says the new
+        // category but the file stays put. Tell the user rather than leaving a silent mismatch.
+        new Notice(`Reclassified in place — couldn't move (a “${file.name}” already exists in ${cat.folder}).`);
+        console.error("Claude Notebook reclassify move failed:", e);
+        return;
+      }
     }
     new Notice(`Reclassified ${from || "?"} → ${cat.slug}`);
   }
 
   /**
-   * M4/ deferred enrich: the ONLY model spend in the facility. One Haiku call
+   * Deferred enrich: the ONLY model spend in the facility. One Haiku call
    * per status:inbox note (≤400-char extract, injection-hardened envelope, JSON out),
    * sequential, capped per run. Sensitive notes are never sent.
    */
@@ -3093,7 +3694,12 @@ export default class ClaudeNotebookPlugin extends Plugin {
       if (cat && fmNow.category === cat.slug && !f.path.includes(`/${cat.folder}/`)) {
         const folder = `${this.cfg.droppedNotesPath}/${cat.folder}`;
         if (!(await this.app.vault.adapter.exists(folder))) await this.app.vault.createFolder(folder);
-        await this.app.fileManager.renameFile(f, `${folder}/${f.name}`);
+        // A collision here must not abort the whole enrich loop (skipping every later note).
+        try {
+          await this.app.fileManager.renameFile(f, `${folder}/${f.name}`);
+        } catch (e) {
+          console.error("Claude Notebook enrich move failed:", e);
+        }
       }
       done++;
     }
@@ -3136,8 +3742,73 @@ export default class ClaudeNotebookPlugin extends Plugin {
       new Notice(
         `Teaching "${ex.title}" — ${reviews.length} reviews scheduled (next ${reviews[0]?.whenISO.slice(0, 10)})`,
       );
-    } catch {
-      /* scheduling is best-effort */
+    } catch (e) {
+      // Surface it: silently swallowing means the lesson looks taught but the retention loop
+      // never got seeded, with no way for the user to notice reviews weren't scheduled.
+      new Notice("Lesson ready, but review scheduling failed — Mastery State.md couldn't be written.");
+      console.error("Claude Notebook teach scheduling failed:", e);
+    }
+  }
+
+  /**
+   * Spaced-review dispatch: closes the Teach-Me loop. Teach-Me/Quiz seed Study/Mastery State.md
+   * with a nextReview date, but nothing ever read it back — reviews were scheduled and then
+   * silently missed. This ONLY reads the mastery file and regenerates a due-reviews checklist;
+   * it never reschedules/advances mastery (re-running "Teach me this" on a topic is what clears
+   * a due review — that stays the user's action).
+   */
+  private async reviewDispatch(quiet: boolean): Promise<void> {
+    let entries;
+    try {
+      entries = await readMastery(this.app, "Study/Mastery State.md");
+    } catch (e) {
+      if (!quiet) new Notice("Couldn't read Mastery State.md.");
+      console.error("Claude Notebook review dispatch read failed:", e);
+      return;
+    }
+    const now = new Date().toISOString();
+    const due = entries
+      .filter((e) => !!e.nextReview && e.nextReview <= now)
+      .sort((a, b) => (a.nextReview < b.nextReview ? -1 : a.nextReview > b.nextReview ? 1 : 0));
+
+    if (!due.length) {
+      if (!quiet) new Notice("No reviews due right now.");
+      return;
+    }
+
+    const dir = "Study";
+    if (!(await this.app.vault.adapter.exists(dir))) await this.app.vault.createFolder(dir);
+
+    const lines: string[] = [];
+    lines.push("---");
+    lines.push("type: due-reviews");
+    lines.push(`updated: ${localDate()}`);
+    lines.push("---");
+    lines.push("");
+    lines.push(`${due.length} review(s) are due. Re-teach a topic to clear it.`);
+    lines.push("");
+    for (const e of due) {
+      // A clean vault-relative note path links; anything else (a URL, a loose label) just shows as text.
+      const isNotePath = !!e.source && !/^https?:\/\//i.test(e.source) && !e.source.includes("://");
+      const src = isNotePath ? `[[${e.source}]]` : e.source || "(unknown source)";
+      const datePart = e.nextReview.slice(0, 10);
+      lines.push(`- [ ] ${src} — due ${datePart}, confidence ${e.confidence}`);
+    }
+    lines.push("");
+    lines.push("Re-run **Teach me this** (or Quiz) on a topic to reschedule it.");
+
+    const notePath = "Study/Due Reviews.md";
+    const body = lines.join("\n") + "\n";
+    if (await this.app.vault.adapter.exists(notePath)) {
+      await this.app.vault.adapter.write(notePath, body);
+    } else {
+      await this.app.vault.create(notePath, body);
+    }
+
+    new Notice(`${due.length} review(s) due → Study/Due Reviews.md`);
+    if (!quiet) {
+      const f = this.app.vault.getAbstractFileByPath(notePath);
+      if (f instanceof TFile) await this.app.workspace.getLeaf(true).openFile(f);
     }
   }
 
@@ -3151,7 +3822,7 @@ export default class ClaudeNotebookPlugin extends Plugin {
       new Notice(`Triage failed: ${String(e)}`);
       return;
     }
-    const notePath = "Everything App/Downloads Triage.md";
+    const notePath = "Downloads Triage.md";
     try {
       if (await this.app.vault.adapter.exists(notePath)) {
         await this.app.vault.adapter.write(notePath, report.reportMarkdown);
@@ -3169,7 +3840,7 @@ export default class ClaudeNotebookPlugin extends Plugin {
     if (f instanceof TFile) await this.app.workspace.getLeaf(true).openFile(f);
   }
 
-  /** Component B: read the focused/most-recent tab and inject it into the Notebook prompt. */
+  /** Send-tab: read the focused/most-recent tab and inject it into the Notebook prompt. */
   private async sendTabToClaude(): Promise<void> {
     const leaf = this.pickReadableLeaf();
     if (!leaf) {
@@ -3368,6 +4039,19 @@ export default class ClaudeNotebookPlugin extends Plugin {
 
   setConvo(path: string, convo: StoredConvo): void {
     this.cnData.conversations[path] = convo;
+    this.scheduleConvoSave();
+  }
+
+  /** Drop a conversation entirely (clear-thread): don't leave an empty husk growing data.json. */
+  deleteConvo(path: string): void {
+    if (this.cnData.conversations[path]) {
+      delete this.cnData.conversations[path];
+      this.scheduleConvoSave();
+    }
+  }
+
+  /** Debounced write of the conversation store (shared by set/delete and the rename/delete hooks). */
+  private scheduleConvoSave(): void {
     if (this.persistTimer) window.clearTimeout(this.persistTimer);
     this.persistTimer = window.setTimeout(() => void this.saveData(this.cnData), 600);
   }

@@ -40,9 +40,47 @@ export function categoryBySlug(slug: string): Category {
   return CATEGORIES.find((c) => c.slug === slug) ?? UNCATEGORIZED;
 }
 
+/**
+ * Optional user-defined filing rules (Feature 5), parsed from the routing-guide note and
+ * consulted by classify() BEFORE the built-in ladder. Empty by default — when empty,
+ * classification is byte-identical to the built-in behaviour. Replaced wholesale each call
+ * so clearing the note clears the rules.
+ */
+let userRules: { name: RegExp; folder: string; slug: string }[] = [];
+
+/** Escape regex metacharacters so a user keyword is matched literally. */
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Parse the routing-guide note body into userRules. One rule per non-empty line:
+ *   `keyword1, keyword2: folder-name`  (a leading "- " bullet is tolerated).
+ * Left side → comma-separated keywords → one case-insensitive alternation regex (keywords
+ * regex-escaped). Right side → folder name (trimmed). slug = folder with a leading `NN-`
+ * number prefix stripped, lowercased. Malformed lines are ignored.
+ */
+export function setUserCategoryRules(lines: string): void {
+  const rules: { name: RegExp; folder: string; slug: string }[] = [];
+  for (const raw of lines.split("\n")) {
+    const m = /^\s*-?\s*(.+?):\s*(\S.*)$/.exec(raw);
+    if (!m) continue;
+    const keywords = m[1]
+      .split(",")
+      .map((k) => k.trim())
+      .filter((k) => k.length > 0);
+    const folder = m[2].trim();
+    if (keywords.length === 0 || !folder) continue;
+    const name = new RegExp(`(${keywords.map(escapeRegex).join("|")})`, "i");
+    const slug = folder.replace(/^\d+-/, "").toLowerCase();
+    rules.push({ name, folder, slug });
+  }
+  userRules = rules;
+}
+
 export interface Classification {
   category: Category;
-  /** 0–1; <0.5 routes to uncategorized/inbox. */
+  /** 0–1; <0.5 routes to uncategorized/inbox (confidence routing). */
   confidence: number;
   /** Which ladder tier decided: "filename" | "path" | "anchor" | "none". */
   via: string;
@@ -54,6 +92,13 @@ export interface Classification {
  * enrich batch, never the drop path.
  */
 export function classify(fileName: string, originPath: string, content: string): Classification {
+  // User-defined filing rules (Feature 5) win over the built-in ladder. When userRules is
+  // empty (the default), this loop is skipped and classification is unchanged.
+  for (const r of userRules) {
+    if (r.name.test(fileName)) {
+      return { category: { folder: r.folder, slug: r.slug, name: r.name }, confidence: 0.9, via: "user-rule" };
+    }
+  }
   for (const c of CATEGORIES) {
     if (c.slug === "uncategorized") continue;
     if (c.name.test(fileName)) return { category: c, confidence: 0.9, via: "filename" };
@@ -90,7 +135,7 @@ export function seedSummary(body: string): string {
   return s.replace(/"/g, "'");
 }
 
-/** Heuristic namespaced tags — free; Haiku refines later. */
+/** Heuristic namespaced tags (controlled vocab) — free; Haiku refines later. */
 export function seedTags(slug: string, fileName: string, noteType: string): string[] {
   const tags = [`cat/${slug}`];
   const n = fileName.toLowerCase();
@@ -104,9 +149,11 @@ export function seedTags(slug: string, fileName: string, noteType: string): stri
   return tags;
 }
 
-/** Note `type` from extension. */
+/** Note `type` from extension. .heic is NOT typed "image": Obsidian can't render it and
+ *  ingest.ts doesn't inline it, so typing it "image" made the note's metadata (embeddable image)
+ *  contradict its body (unsupported-type stub). It falls through to a stub, matching ingest. */
 export function noteTypeOf(ext: string, converted: boolean): string {
-  if ([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".heic"].includes(ext)) return "image";
+  if ([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"].includes(ext)) return "image";
   if ([".xlsx", ".xls", ".xlsm", ".csv", ".tsv"].includes(ext)) return "spreadsheet";
   if (ext === ".pdf") return "pdf-doc";
   if ([".md", ".markdown", ".txt", ".text"].includes(ext)) return "text";
@@ -156,9 +203,13 @@ export function parseIcs(text: string): IcsEvent[] {
   const lines = text.replace(/\r/g, "").replace(/\n[ \t]/g, "").split("\n"); // unfold RFC5545 continuations
   const out: IcsEvent[] = [];
   let cur: Record<string, string> | null = null;
+  let nested = 0; // depth of nested components (VALARM etc.) inside the current VEVENT
   for (const l of lines) {
-    if (l === "BEGIN:VEVENT") cur = {};
-    else if (l === "END:VEVENT") {
+    if (l === "BEGIN:VEVENT") {
+      cur = {};
+      nested = 0;
+    } else if (l === "END:VEVENT") {
+      nested = 0;
       if (cur?.DTSTART && cur.SUMMARY) {
         const s = icsDate(cur.DTSTART);
         const e = cur.DTEND ? icsDate(cur.DTEND) : null;
@@ -176,6 +227,17 @@ export function parseIcs(text: string): IcsEvent[] {
       }
       cur = null;
     } else if (cur) {
+      // A VEVENT often wraps a VALARM whose own SUMMARY/ATTENDEE would otherwise overwrite the
+      // event's fields (later assignment wins) — record properties only at VEVENT depth.
+      if (l.startsWith("BEGIN:")) {
+        nested++;
+        continue;
+      }
+      if (l.startsWith("END:")) {
+        if (nested > 0) nested--;
+        continue;
+      }
+      if (nested > 0) continue;
       const i = l.indexOf(":");
       if (i > 0) cur[l.slice(0, i).split(";")[0].toUpperCase()] = l.slice(i + 1);
     }

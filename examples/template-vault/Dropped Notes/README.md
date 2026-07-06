@@ -1,0 +1,1 @@
+Drop a PDF, Office doc, image, or link anywhere in Obsidian and it's converted, classified, and filed here automatically (document conversion needs Python + the bundled `convert.py` — see the plugin README). Nothing you drop is lost.

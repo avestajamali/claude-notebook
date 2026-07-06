@@ -39,11 +39,13 @@ export async function recordTeachSession(
   now: Date,
 ): Promise<{ reviews: { interval: number; whenISO: string }[] }> {
   const reviews = scheduleReviews(now, availability);
+  const p = (n: number) => String(n).padStart(2, "0");
+  const localDay = `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}`; // local, not UTC
   const entry: MasteryEntry = {
     topic: ex.title,
     source: ex.source,
     confidence: 30,
-    lastTaught: now.toISOString().slice(0, 10),
+    lastTaught: localDay,
     nextReview: reviews[0]?.whenISO ?? "",
     lapses: 0,
   };

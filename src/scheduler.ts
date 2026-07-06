@@ -3,14 +3,19 @@ import { App, normalizePath } from "obsidian";
 /**
  * Availability-aware spaced-review scheduler.
  *
- * Reviews follow an SM-2-style curve but SNAP to free study windows — never
- * Wednesday daytime or Sat/Sun 07:00–15:00 (work). Mastery state is persisted as a
- * frontmatter + JSON data file (NO fenced code block — fence-bug rule,),
+ * Reviews follow a fixed [1,3,7,16]-day curve, each date walked forward to the next study day
+ * (primeDays plus primeEvenings) and stamped at defaultTimes. Mastery state is persisted as a
+ * frontmatter + JSON data file (no fenced code block, to stay robust to markdown fence handling),
  * read back via frontmatter-strip + JSON.parse.
+ *
+ * NOTE: busyDays and workWindows are reserved for a future time-of-day-aware pass; the current
+ * slot logic reads only primeDays/primeEvenings/defaultTimes.
  */
 
 export interface Availability {
+  /** Reserved (not yet consulted by nextReviewSlot). */
   busyDays: string[];
+  /** Reserved (not yet consulted by nextReviewSlot). */
   workWindows: { day: string; start: string; end: string }[];
   primeDays: string[];
   primeEvenings: string[];
@@ -18,15 +23,11 @@ export interface Availability {
   reviewCurveDays: number[];
 }
 
-/** Matches Codex/Everything App/Availability.md. The runtime can override from that note. */
 export const DEFAULT_AVAILABILITY: Availability = {
-  busyDays: ["Wed"],
-  workWindows: [
-    { day: "Sat", start: "07:00", end: "15:00" },
-    { day: "Sun", start: "07:00", end: "15:00" },
-  ],
-  primeDays: ["Mon", "Tue", "Thu", "Fri"],
-  primeEvenings: ["Wed", "Sat", "Sun"],
+  busyDays: [],
+  workWindows: [],
+  primeDays: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+  primeEvenings: [],
   defaultTimes: { weekday: "18:00", weekend: "16:00" },
   reviewCurveDays: [1, 3, 7, 16],
 };
@@ -92,9 +93,45 @@ export async function writeMastery(app: App, vaultPath: string, entries: Mastery
 }
 
 export async function upsertMastery(app: App, vaultPath: string, entry: MasteryEntry): Promise<void> {
-  const all = await readMastery(app, vaultPath);
-  const i = all.findIndex((e) => e.topic === entry.topic);
-  if (i >= 0) all[i] = entry;
-  else all.push(entry);
+  const norm = normalizePath(vaultPath);
+  let all: MasteryEntry[] = [];
+  if (await app.vault.adapter.exists(norm)) {
+    const raw = await app.vault.adapter.read(norm);
+    const body = (raw || "").replace(/^---[\s\S]*?---\s*/, "").trim();
+    try {
+      const parsed = JSON.parse(body || "[]");
+      all = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      // Corrupt (OneDrive sync-conflict artifact, a manual reformat) — DON'T silently overwrite the
+      // whole spaced-repetition history with one seed entry. Back it up to a uniquified side file;
+      // if the backup can't be written (OneDrive lock — the exact case this targets), BAIL rather
+      // than clobber the only copy that exists.
+      const p = (n: number) => String(n).padStart(2, "0");
+      const d = new Date();
+      const day = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+      let bak = `${norm.replace(/\.md$/, "")} (corrupt ${day}).md`;
+      for (let n = 2; await app.vault.adapter.exists(bak); n++) {
+        bak = `${norm.replace(/\.md$/, "")} (corrupt ${day} ${n}).md`;
+      }
+      try {
+        await app.vault.adapter.write(bak, raw);
+      } catch {
+        return; // couldn't preserve the corrupt data — do not overwrite it with a fresh seed
+      }
+      all = [];
+    }
+  }
+  // Match on topic AND source (same lecture title from two notes shouldn't overwrite), and carry
+  // forward the retention history rather than resetting lapses/confidence on every re-teach.
+  const i = all.findIndex((e) => e.topic === entry.topic && e.source === entry.source);
+  if (i >= 0) {
+    all[i] = {
+      ...entry,
+      lapses: all[i].lapses ?? entry.lapses,
+      confidence: Math.max(all[i].confidence ?? 0, entry.confidence),
+    };
+  } else {
+    all.push(entry);
+  }
   await writeMastery(app, vaultPath, all);
 }

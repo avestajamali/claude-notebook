@@ -1,7 +1,7 @@
 import { spawn } from "child_process";
 
 /**
- * Bridge to Engine/convert.py — the Tier-0..4 local conversion engine.
+ * Bridge to convert.py — the Tier-0..4 local conversion engine.
  *
  * We invoke `python convert.py "<file>" --quality`, which prints a structured JSON
  * result (with the big md_text stripped), instead of parsing the human-readable

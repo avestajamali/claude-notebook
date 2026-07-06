@@ -6,11 +6,26 @@ An Obsidian plugin that fuses a Markdown note with a live Claude agent. Open a n
 
 ## What it does
 
-- **Chat** against the active note — Claude reads your note (and related notes) and answers grounded in your own material.
-- **Edit mode** — ask Claude to revise the current note; it edits that file directly and leaves the rest of your vault alone.
-- **Quiz mode** — turn any note into a one-question-at-a-time Socratic review.
-- **Drop to file** — drop a PDF/Office document (or a URL) anywhere in Obsidian and the plugin converts it to clean Markdown and files it by a local, zero-network taxonomy.
-- **Model tiering** — pick separate models for heavy analysis, everyday turns, and cheap classification.
+- **Chat** against the active note — grounded in your own material, with **heading-level citations** you can hover to preview the exact source passage.
+- **Ask your whole vault** — a read-only mode that searches every note (agentic grep, no index) and cites what it consulted, plus a "Find in my notes" ranked search.
+- **Multi-note context tray** — pin several notes and **"Synthesise across these"** into one explanation with a `[[wikilink]]` per claim. Study a whole subject, not one lecture.
+- **Edit mode** — ask Claude to revise the current note; writes are **path-scoped to your vault** and every edit is **one-click undoable** (a multi-level stack).
+- **Quiz mode + study presets** — Socratic quizzing, practice questions, flashcards, explain-simply, predict-exam, weak-spots, mark-my-answer.
+- **Spaced review** — teach a topic once and the plugin schedules spaced reviews and resurfaces what's due.
+- **Drop to file** — drop a PDF/Office document (or a URL) anywhere and the plugin converts it to clean Markdown and files it by a local, zero-network taxonomy (customisable via a routing note).
+- **Style-guide note** — point the plugin at a note of your own conventions and it shapes every answer.
+
+## Try it
+
+Two ready-to-open vaults live in this repo:
+
+- **`examples/demo-vault`** — pre-filled with linked course notes, a spaced-review schedule, and filed documents, so you can see every feature working immediately. Open it, sign the CLI in, and press <kbd>Ctrl/Cmd</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd>.
+- **`examples/template-vault`** — a clean, structured starter. Open it, read `Start Here.md`, rename the example subject, and begin your own study.
+
+## Demo
+
+<!-- gifs added on release; see the recording shot-list -->
+*Screenshots and gifs coming with the next release.*
 
 ## Requirements
 

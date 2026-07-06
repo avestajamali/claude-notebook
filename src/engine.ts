@@ -11,15 +11,37 @@ import * as path from "path";
  *  - The prompt is passed to the CLI over STDIN, never on the command line, so chat
  *    content can never be interpreted by a shell.
  *  - Tools are gated by an explicit ALLOWLIST per mode — read-only modes cannot write,
- *    and NO mode is granted Bash/WebFetch/WebSearch/Task. `bypassPermissions` is never used.
+ *    and NO mode is granted Bash/WebFetch/WebSearch/Task. The CLI's fully-permissive
+ *    "bypass" permission mode is never used.
  *  - The permission mode is pinned per call: read-only turns run in `default`; edit turns
  *    run in `acceptEdits` so the allowlisted Write/Edit execute unprompted in headless mode.
+ *  - Edit turns pass `writeRoot` (the vault root): the write grant is emitted path-scoped
+ *    to that tree, so a prompt-injected turn can't write outside the vault — a write no
+ *    rule matches is simply denied in headless mode.
  */
 
 /** Read-only tool set: inspect the vault, never mutate it, never touch shell or network. */
 const READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "LS", "TodoWrite"];
-/** Edit mode adds file writes — still no Bash/WebFetch/WebSearch/Task. */
-const EDIT_TOOLS = [...READ_ONLY_TOOLS, "Write", "Edit", "MultiEdit"];
+/** The file-writing tools edit mode adds — still no Bash/WebFetch/WebSearch/Task. */
+const WRITE_TOOLS = ["Write", "Edit", "MultiEdit"];
+/** Unscoped edit set — the fallback when no usable writeRoot is available. */
+const EDIT_TOOLS = [...READ_ONLY_TOOLS, ...WRITE_TOOLS];
+
+/**
+ * An absolute OS path as a permission-rule path specifier: `//`-anchored, POSIX slashes,
+ * Windows drive letter lowercased, `/**` appended so the rule covers the whole tree —
+ * `C:\Vault` → `//c/Vault/**` (docs: code.claude.com/docs/en/permissions, "Read and Edit";
+ * behaviour verified against Claude Code 2.1.199). Returns null for a non-absolute path:
+ * a relative pattern would anchor at the cwd and could scope the grant to the wrong tree,
+ * so the caller falls back to the unscoped tools instead.
+ */
+function scopeSpecifier(root: string): string | null {
+  let p = root.replace(/\\/g, "/").replace(/\/+$/, "");
+  const drive = /^([A-Za-z]):($|\/)/.exec(p);
+  if (drive) p = `/${drive[1].toLowerCase()}${p.slice(2)}`;
+  if (!p.startsWith("/") || p === "/") return null;
+  return `/${p}/**`;
+}
 
 /** Hard cap on one turn — breaks a wedged child that never emits `close` so `busy` can't stick. */
 const TURN_TIMEOUT_MS = 20 * 60 * 1000;
@@ -45,6 +67,11 @@ export interface RunOpts {
   systemPrompt?: string;
   /** chat/quiz = true (read-only tools only). edit/save = false (Write/Edit granted, acceptEdits mode). */
   readOnly: boolean;
+  /** Absolute OS path writes are confined to on edit turns (normally the vault root). When set,
+   *  the write grant is emitted as path-scoped rules (`Edit(//c/vault/**)`) instead of bare tool
+   *  names, so the turn can't write outside it. Ignored on readOnly turns; unset, non-absolute,
+   *  or on the .cmd-shim spawn path it falls back to today's bare write tools. */
+  writeRoot?: string;
   /** Pin the model for this spawn — e.g. "claude-opus-4-8" for analysis, "claude-haiku-4-5"
    *  for cheap classify/route. Omit to use the CLI/subscription default. */
   model?: string;
@@ -94,9 +121,33 @@ export class ClaudeEngine {
     const { cmd, shell } = resolveClaude();
 
     const env = { ...process.env };
-    // Use the CLI's interactive login rather than an API key picked up from the
-    // environment, so usage stays on the account the CLI is signed in to.
+    // Use the CLI's interactive login rather than an env-borne credential/endpoint, so
+    // every turn stays on the account the CLI is signed in to. Scrub the whole family:
+    // API_KEY and AUTH_TOKEN both override the login; BASE_URL and the Bedrock/Vertex
+    // switches would silently redirect turns (with full note bodies) to another endpoint.
     delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+    delete env.ANTHROPIC_BASE_URL;
+    delete env.CLAUDE_CODE_USE_BEDROCK;
+    delete env.CLAUDE_CODE_USE_VERTEX;
+
+    // Scope the write grant to writeRoot. A BARE allow rule matches every path, so it would
+    // bypass acceptEdits' working-directory scoping and let an edit turn write outside the
+    // vault; scoped, an out-of-root write matches no rule and headless mode denies it, while
+    // in-root writes are covered by both the rule and acceptEdits itself. The `Edit(...)`
+    // rule family gates ALL file-writing tools — on CLI 2.1.199 a scoped `Write(...)` rule
+    // is inert (verified), but it rides along for CLI versions that honor it: scoped rules
+    // can only ever be narrower than bare grants. On the .cmd-shim path (shell:true) cmd.exe
+    // receives argv space-joined and unquoted, so a specifier containing spaces (vault paths
+    // often do) would shatter into garbage rules — keep the bare tools there (known gap; that
+    // path is only taken when claude.exe itself is missing).
+    const writeScope =
+      !opts.readOnly && !shell && opts.writeRoot ? scopeSpecifier(opts.writeRoot) : null;
+    const allowedTools = opts.readOnly
+      ? READ_ONLY_TOOLS
+      : writeScope
+        ? [...READ_ONLY_TOOLS, ...WRITE_TOOLS.map((t) => `${t}(${writeScope})`)]
+        : EDIT_TOOLS;
 
     // The prompt is delivered over stdin (below), never as an argv entry, so it can never
     // be parsed by a shell. The permission mode is explicit so edit-mode writes don't ride
@@ -110,7 +161,7 @@ export class ClaudeEngine {
       "--permission-mode",
       opts.readOnly ? "default" : "acceptEdits",
       "--allowedTools",
-      ...(opts.readOnly ? READ_ONLY_TOOLS : EDIT_TOOLS),
+      ...allowedTools,
     ];
     if (opts.model) {
       args.push("--model", opts.model);
@@ -119,8 +170,11 @@ export class ClaudeEngine {
       args.push("--resume", opts.sessionId);
     } else if (opts.systemPrompt) {
       // The system prompt is the only free-form argv value. On the shell:true (.cmd shim)
-      // fallback, strip `%` so a `%VAR%` in an embedded note path can't be cmd.exe-expanded.
-      const sp = shell ? opts.systemPrompt.replace(/%/g, "") : opts.systemPrompt;
+      // fallback the whole command line is handed to cmd.exe unquoted, so strip the
+      // characters that let cmd.exe expand or chain: `%VAR%` expansion, and the
+      // &, |, <, >, ^ metacharacters (a note path may legally contain them). The
+      // .exe path (shell:false) passes argv discretely and needs no stripping.
+      const sp = shell ? opts.systemPrompt.replace(/[%&|<>^]/g, "") : opts.systemPrompt;
       args.push("--append-system-prompt", sp);
     }
 
@@ -171,7 +225,10 @@ export class ClaudeEngine {
     }
 
     const processLine = (raw: string) => {
-      if (superseded()) return;
+      // `done` guards the window between finish() (watchdog/error paths, which don't bump
+      // runToken) and the child actually dying: late stdout must not push into a turn the
+      // view has already completed (invariant 6).
+      if (done || superseded()) return;
       const line = raw.trim();
       if (!line) return;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any

@@ -69,7 +69,9 @@ function importanceOf(name: string, bucket: Bucket): ScannedItem["importance"] {
   if (bucket === "installer") return "junk-safe";
   if (/\.(log|tmp)$/i.test(name)) return "junk-safe";
   // Important: records and user-authored work (conservative — when unsure, keep).
-  if (/(tax|invoice|receipt|statement|payslip|certificate|transcript|contract|passport|id|licen[cs]e|signed)/.test(n)) {
+  // The short tokens carry word boundaries: bare "id"/"tax"/"signed" otherwise match
+  // video/guide/holiday/syntax/designed and drown the real records in the triage report.
+  if (/(invoice|receipt|statement|payslip|certificate|transcript|contract|passport|licen[cs]e|\btax\b|\bid\b|\bsigned\b)/.test(n)) {
     return "important";
   }
   if (bucket === "document" && !/template/.test(n)) return "important";

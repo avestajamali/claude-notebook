@@ -1,10 +1,10 @@
 # build artifacts (main.js is attached to GitHub releases, not committed)
 node_modules/
-main.js
+/main.js
 *.map
 
 # runtime / local state that must never be published
-data.json
+/data.json
 *.bak
 .hotreload
 .claude/

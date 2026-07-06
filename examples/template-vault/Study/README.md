@@ -1,0 +1,1 @@
+Notes you create with **"Save as study note"** — practice questions, summaries, flashcards, cheat sheets — are saved here, cited back to your source notes. Spaced-review due lists (`Due Reviews.md`) also appear here.

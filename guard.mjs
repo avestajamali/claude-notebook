@@ -1,5 +1,5 @@
-// M0.5 hard-constraint grep guard (FILE_FACILITY_PLAN §0/§8.4): the build FAILS if any
-// browser/webview/RSS/incognito surface reappears in src/. Cut in eaefd18; never returns.
+// Hard-constraint grep guard: the build FAILS if any
+// browser/webview/RSS/incognito surface reappears in src/.
 import { readdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { fileURLToPath } from "url";

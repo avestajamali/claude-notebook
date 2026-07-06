@@ -4,7 +4,7 @@ import * as path from "path";
 import { convertToMarkdown } from "./convert-bridge";
 
 /**
- * Component B — "Send this tab to Claude".
+ * Send-tab context — "Send this tab to Claude".
  *
  * Reads the content of an arbitrary leaf so the agent can work with it:
  *   - MarkdownView  -> the note's text
