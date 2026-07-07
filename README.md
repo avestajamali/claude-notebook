@@ -15,6 +15,16 @@ An Obsidian plugin that fuses a Markdown note with a live Claude agent. Open a n
 - **Drop to file** — drop a PDF/Office document (or a URL) anywhere and the plugin converts it to clean Markdown and files it by a local, zero-network taxonomy (customisable via a routing note).
 - **Style-guide note** — point the plugin at a note of your own conventions and it shapes every answer.
 
+## How it works
+
+![Architecture: the panel sends a prompt over stdin to a local Claude CLI subprocess, which reads and edits your vault files inside a trust boundary that denies shell, web, and task-spawning tools.](docs/media/architecture.svg)
+
+*The panel talks to a local Claude CLI subprocess over stdin — no API key, and shell, web, and task-spawning tools are never granted.*
+
+![The study loop: drop course files, they get filed and classified, chat or quiz grounded in your notes, save a cited study note, and spaced review resurfaces what is due.](docs/media/study-loop.svg)
+
+*One loop takes a dropped lecture PDF all the way to spaced, exam-ready review — every answer grounded in your own notes.*
+
 ## Try it
 
 Two ready-to-open vaults live in this repo:
@@ -25,7 +35,16 @@ Two ready-to-open vaults live in this repo:
 ## Demo
 
 <!-- gifs added on release; see the recording shot-list -->
-*Screenshots and gifs coming with the next release.*
+
+![Line chart: pinning note bodies injects roughly 6,000 characters each and hits a 24k truncation cliff after about four notes, while pinning paths stays near flat at roughly 40 characters each.](docs/media/tray-tokens.svg)
+
+*The context tray pins file paths, not bodies — so the agent reads each live file instead of hitting the truncation cliff.*
+
+![Conversion ladder: tiers 0 to 2 turn Office, PDF, and text files into Markdown locally at roughly zero model tokens; tier 3 renders only image-only pages for a visual read; tier 4 archives audio or video behind a pointer stub.](docs/media/convert-tiers.svg)
+
+*Drop any file and it climbs the cheapest rung that works — tiers 0 to 2 cost roughly zero model tokens.*
+
+*(gifs coming soon)*
 
 ## Requirements
 
@@ -45,6 +64,8 @@ This plugin is transparent about every external action it takes:
 
 - The prompt is passed to the CLI over **stdin**, never on the command line, so note or chat content can never be interpreted by a shell.
 - Tools are gated by an explicit **allowlist** per mode. Read-only modes (chat, quiz) get only `Read`, `Grep`, `Glob`, `LS`; edit mode adds `Write`, `Edit`, `MultiEdit`. **No mode is ever granted shell (`Bash`), web, or task-spawning tools**, and the CLI's `bypassPermissions` mode is never used.
+
+![Allowlist matrix: read tools are granted in every mode, write tools only in edit and save (path-scoped to your vault), and shell or web tools in no mode.](docs/media/security-model.svg)
 
 ## Install (manual)
 

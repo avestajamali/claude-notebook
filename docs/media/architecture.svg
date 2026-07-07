@@ -1,0 +1,66 @@
+<svg viewBox="0 0 880 420" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif">
+  <rect x="0" y="0" width="880" height="420" fill="#0d1117"/>
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#7fd8d8"/>
+    </marker>
+    <marker id="ahp" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#f4a0c0"/>
+    </marker>
+  </defs>
+
+  <text x="40" y="44" fill="#e6edf3" font-size="21" font-weight="700">How Claude Notebook talks to Claude</text>
+
+  <!-- Obsidian panel -->
+  <rect x="40" y="92" width="180" height="118" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="130" y="128" fill="#e6edf3" font-size="14" font-weight="600" text-anchor="middle">Obsidian</text>
+  <text x="130" y="150" fill="#8b949e" font-size="12.5" text-anchor="middle">Notebook side panel</text>
+  <text x="130" y="182" fill="#f4a0c0" font-size="12.5" text-anchor="middle">chat · quiz · edit</text>
+
+  <!-- prompt over stdin arrow -->
+  <line x1="220" y1="140" x2="352" y2="140" stroke="#f4a0c0" stroke-width="2" marker-end="url(#ahp)"/>
+  <text x="286" y="128" fill="#f4a0c0" font-size="11.5" text-anchor="middle">prompt over</text>
+  <text x="286" y="120" fill="#f4a0c0" font-size="11.5" font-weight="700" text-anchor="middle">stdin</text>
+
+  <!-- CLI subprocess (inside trust boundary) -->
+  <rect x="356" y="86" width="228" height="130" rx="10" fill="#161b22" stroke="#7fd8d8" stroke-width="1.8"/>
+  <text x="470" y="120" fill="#e6edf3" font-size="14" font-weight="600" text-anchor="middle">Claude Code CLI</text>
+  <text x="470" y="140" fill="#8b949e" font-size="12.5" text-anchor="middle">local subprocess</text>
+  <text x="470" y="168" fill="#7fd8d8" font-size="12" text-anchor="middle">your subscription</text>
+  <text x="470" y="186" fill="#7fd8d8" font-size="12" text-anchor="middle">no API key</text>
+
+  <!-- stream-json deltas back -->
+  <path d="M356 176 C 300 210, 250 210, 220 176" fill="none" stroke="#7fd8d8" stroke-width="2" marker-end="url(#ah)"/>
+  <text x="286" y="228" fill="#7fd8d8" font-size="11.5" text-anchor="middle">stream-json deltas</text>
+
+  <!-- vault files box -->
+  <rect x="356" y="288" width="228" height="96" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="470" y="320" fill="#e6edf3" font-size="14" font-weight="600" text-anchor="middle">Your vault files</text>
+  <text x="470" y="344" fill="#8b949e" font-size="11.5" text-anchor="middle">Read / Grep / Glob (always)</text>
+  <text x="470" y="362" fill="#8b949e" font-size="11.5" text-anchor="middle">Write scoped to vault (edit mode only)</text>
+
+  <!-- CLI to vault arrows -->
+  <line x1="470" y1="216" x2="470" y2="286" stroke="#7fd8d8" stroke-width="2" marker-end="url(#ah)"/>
+
+  <!-- trust boundary dashed box -->
+  <rect x="336" y="66" width="512" height="336" rx="14" fill="none" stroke="#e3c07b" stroke-width="1.6" stroke-dasharray="7 5"/>
+  <text x="344" y="86" fill="#e3c07b" font-size="12.5" font-weight="600">trust boundary</text>
+
+  <!-- three denied badges -->
+  <g>
+    <rect x="636" y="120" width="196" height="40" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.4"/>
+    <text x="656" y="145" fill="#f4a0c0" font-size="15" font-weight="700">✕</text>
+    <text x="676" y="145" fill="#e6edf3" font-size="13">Bash (shell)</text>
+  </g>
+  <g>
+    <rect x="636" y="172" width="196" height="40" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.4"/>
+    <text x="656" y="197" fill="#f4a0c0" font-size="15" font-weight="700">✕</text>
+    <text x="676" y="197" fill="#e6edf3" font-size="13">Web (fetch / search)</text>
+  </g>
+  <g>
+    <rect x="636" y="224" width="196" height="40" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.4"/>
+    <text x="656" y="249" fill="#f4a0c0" font-size="15" font-weight="700">✕</text>
+    <text x="676" y="249" fill="#e6edf3" font-size="13">Task-spawn</text>
+  </g>
+  <text x="734" y="292" fill="#8b949e" font-size="11.5" text-anchor="middle">never granted, any mode</text>
+</svg>

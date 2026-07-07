@@ -1,0 +1,67 @@
+<svg viewBox="0 0 880 470" xmlns="http://www.w3.org/2000/svg" font-family="ui-sans-serif, -apple-system, Segoe UI, sans-serif">
+  <rect x="0" y="0" width="880" height="470" fill="#0d1117"/>
+  <defs>
+    <marker id="lah" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#7fd8d8"/>
+    </marker>
+  </defs>
+
+  <text x="440" y="34" fill="#e6edf3" font-size="21" font-weight="700" text-anchor="middle">One loop from lecture PDF to exam-ready</text>
+
+  <!-- clockwise arcs between nodes (center 440,255 r=160) -->
+  <!-- node centers: N1 top(440,95) N2(578,175) N3(578,335) N4 bottom(440,415) N5(302,335) N6(302,175) -->
+  <g fill="none" stroke="#7fd8d8" stroke-width="2">
+    <path d="M492,110 A160,160 0 0 1 566,132" marker-end="url(#lah)"/>
+    <path d="M592,220 A160,160 0 0 1 592,290" marker-end="url(#lah)"/>
+    <path d="M566,378 A160,160 0 0 1 492,400" marker-end="url(#lah)"/>
+    <path d="M388,400 A160,160 0 0 1 314,378" marker-end="url(#lah)"/>
+    <path d="M288,290 A160,160 0 0 1 288,220" marker-end="url(#lah)"/>
+    <path d="M314,132 A160,160 0 0 1 388,110" marker-end="url(#lah)"/>
+  </g>
+
+  <!-- center label -->
+  <text x="440" y="250" fill="#f4a0c0" font-size="17" font-weight="700" text-anchor="middle">the study loop</text>
+  <text x="440" y="272" fill="#8b949e" font-size="12" text-anchor="middle">grounded in YOUR notes</text>
+
+  <!-- N1 top: Drop course files -->
+  <g>
+    <rect x="352" y="70" width="176" height="50" rx="10" fill="#161b22" stroke="#f4a0c0" stroke-width="1.6"/>
+    <text x="440" y="90" fill="#e6edf3" font-size="13" font-weight="600" text-anchor="middle">Drop course files</text>
+    <text x="440" y="107" fill="#8b949e" font-size="11" text-anchor="middle">PDF · Office · URL</text>
+  </g>
+
+  <!-- N2 upper-right: Filed + classified -->
+  <g>
+    <rect x="588" y="150" width="184" height="50" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.6"/>
+    <text x="680" y="170" fill="#e6edf3" font-size="13" font-weight="600" text-anchor="middle">Filed + classified notes</text>
+    <text x="680" y="187" fill="#8b949e" font-size="11" text-anchor="middle">local taxonomy</text>
+  </g>
+
+  <!-- N3 lower-right: Chat / Ask -->
+  <g>
+    <rect x="588" y="310" width="184" height="50" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.6"/>
+    <text x="680" y="330" fill="#e6edf3" font-size="13" font-weight="600" text-anchor="middle">Chat / Ask grounded</text>
+    <text x="680" y="347" fill="#8b949e" font-size="11" text-anchor="middle">heading-level citations</text>
+  </g>
+
+  <!-- N4 bottom: Quiz / mark answers -->
+  <g>
+    <rect x="352" y="390" width="176" height="50" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.6"/>
+    <text x="440" y="410" fill="#e6edf3" font-size="13" font-weight="600" text-anchor="middle">Quiz / mark answers</text>
+    <text x="440" y="427" fill="#8b949e" font-size="11" text-anchor="middle">Socratic · weak-spots</text>
+  </g>
+
+  <!-- N5 lower-left: Save cited study note -->
+  <g>
+    <rect x="108" y="310" width="184" height="50" rx="10" fill="#161b22" stroke="#e3c07b" stroke-width="1.6"/>
+    <text x="200" y="330" fill="#e6edf3" font-size="13" font-weight="600" text-anchor="middle">Save cited study note</text>
+    <text x="200" y="347" fill="#e3c07b" font-size="11" text-anchor="middle">[[wikilink]] per claim</text>
+  </g>
+
+  <!-- N6 upper-left: Spaced review -->
+  <g>
+    <rect x="108" y="150" width="184" height="50" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1.6"/>
+    <text x="200" y="170" fill="#e6edf3" font-size="13" font-weight="600" text-anchor="middle">Spaced review</text>
+    <text x="200" y="187" fill="#8b949e" font-size="11" text-anchor="middle">resurfaces what's due</text>
+  </g>
+</svg>
