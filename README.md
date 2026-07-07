@@ -27,10 +27,8 @@ An Obsidian plugin that fuses a Markdown note with a live Claude agent. Open a n
 
 ## Try it
 
-Two ready-to-open vaults live in this repo:
-
-- **`examples/demo-vault`** — pre-filled with linked course notes, a spaced-review schedule, and filed documents, so you can see every feature working immediately. Open it, sign the CLI in, and press <kbd>Ctrl/Cmd</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd>.
-- **`examples/template-vault`** — a clean, structured starter. Open it, read `Start Here.md`, rename the example subject, and begin your own study.
+- **`examples/demo-vault`** (in this repo) — pre-filled with linked course notes, a spaced-review schedule, and filed documents, so you can see every feature working immediately. Open it, sign the CLI in, and press <kbd>Ctrl/Cmd</kbd>+<kbd>Shift</kbd>+<kbd>K</kbd>.
+- **[Sumi Starter Vault](https://github.com/avestajamali/sumi-starter-vault)** — want a clean vault to *keep*, not just a demo? This standalone starter bundles Claude Notebook with the [Sumi](https://github.com/avestajamali/sumi) theme, a calendar, a pre-coloured graph, and a customizable homepage — download it and start your own vault straight away.
 
 ## Demo
 
